@@ -12,16 +12,19 @@ export default function LoginPage() {
   const [loading, setLoading]   = useState(false);
   const [error, setError]       = useState('');
 
-  async function handleLogin(e: React.FormEvent) {
-    e.preventDefault();
-    setLoading(true); setError('');
-    const sb = createClient();
-    const { error } = await sb.auth.signInWithPassword({ email, password });
-    if (error) { setError(error.message); setLoading(false); return; }
-    router.push('/dashboard');
-    router.refresh();
+async function handleLogin(e: React.FormEvent) {
+  e.preventDefault();
+  setLoading(true); setError('');
+  const sb = createClient();
+  const { data, error } = await sb.auth.signInWithPassword({ email, password });
+  if (error) { 
+    setError(error.message); 
+    setLoading(false); 
+    return; 
   }
-
+  console.log('Login ok, user:', data.user?.email);
+  window.location.replace('/dashboard');
+}
   async function handleGoogle() {
     const sb = createClient();
     await sb.auth.signInWithOAuth({

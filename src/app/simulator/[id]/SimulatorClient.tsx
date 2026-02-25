@@ -1,10 +1,9 @@
 'use client';
 
 import { useEffect, useRef, useState, useCallback } from 'react';
-import { useRouter } from 'next/navigation';
 import Link from 'next/link';
 import { createClient } from '@/lib/supabase/client';
-import type { DbProject, DbSprinklerModel, PlacedSprinkler, Pipe, Point, Circuit, ManualPipe } from '@/types';
+import type { DbProject, DbSprinklerModel, PlacedSprinkler, Pipe, Point } from '@/types';
 
 interface Props {
   project:     DbProject;
@@ -12,678 +11,1574 @@ interface Props {
   isOwner:     boolean;
 }
 
-// ── Geometry helpers ─────────────────────────────────────────
-function pip(pt: Point, poly: {x:number,y:number}[]): boolean {
+interface WaterSource {
+  xm: number;
+  ym: number;
+  x:  number;
+  y:  number;
+}
+
+// ════════════════════════════════════════════════════════════
+// GEOMETRY
+// ════════════════════════════════════════════════════════════
+function pip(pt: {x:number,y:number}, poly: {x:number,y:number}[]): boolean {
   let inside = false;
-  for (let i = 0, j = poly.length-1; i < poly.length; j = i++) {
-    const xi=poly[i].x, yi=poly[i].y, xj=poly[j].x, yj=poly[j].y;
-    if (((yi>pt.y)!==(yj>pt.y)) && (pt.x < (xj-xi)*(pt.y-yi)/(yj-yi)+xi)) inside=!inside;
+  for (let i=0, j=poly.length-1; i<poly.length; j=i++) {
+    const xi=poly[i].x,yi=poly[i].y,xj=poly[j].x,yj=poly[j].y;
+    if (((yi>pt.y)!==(yj>pt.y)) && pt.x<(xj-xi)*(pt.y-yi)/(yj-yi)+xi) inside=!inside;
   }
   return inside;
 }
+
 function bbox(pts: {x:number,y:number}[]) {
   return {
     minX:Math.min(...pts.map(p=>p.x)), maxX:Math.max(...pts.map(p=>p.x)),
     minY:Math.min(...pts.map(p=>p.y)), maxY:Math.max(...pts.map(p=>p.y)),
   };
 }
-function polyArea(pts: {x:number,y:number}[]): number {
-  let a=0; for(let i=0,j=pts.length-1;i<pts.length;j=i++) a+=pts[j].x*pts[i].y-pts[i].x*pts[j].y;
+
+function polyAreaM(pts: {x:number,y:number}[]): number {
+  let a=0;
+  for (let i=0,j=pts.length-1;i<pts.length;j=i++) a+=pts[j].x*pts[i].y-pts[i].x*pts[j].y;
   return Math.abs(a/2);
 }
 
-// ── MST (Prim's algorithm) ───────────────────────────────────
-function buildMST(nodes: {x:number,y:number}[], circIdx: number, type0: 'main'|'branch'): Pipe[] {
-  if (nodes.length < 2) return [];
-  const visited = new Set([0]);
-  const edges: Pipe[] = [];
-  while (visited.size < nodes.length) {
-    let best: Pipe|null = null, bestD = Infinity;
-    visited.forEach(vi => {
-      nodes.forEach((n, j) => {
-        if (visited.has(j)) return;
-        const d = Math.hypot(nodes[vi].x - n.x, nodes[vi].y - n.y);
-        if (d < bestD) {
-          bestD = d;
-          best = { from: nodes[vi], to: n, type: vi===0 ? type0 : 'branch', circIdx, lengthM: d };
-        }
-      });
-    });
-    if (!best) break;
-    edges.push(best); visited.add(nodes.findIndex(n => n===((best as Pipe).to)));
-  }
-  return edges;
+// Distance from point to line segment
+function ptToSegDist(px:number,py:number, ax:number,ay:number, bx:number,by:number): number {
+  const dx=bx-ax, dy=by-ay, len2=dx*dx+dy*dy;
+  if (len2===0) return Math.hypot(px-ax,py-ay);
+  const t=Math.max(0,Math.min(1,((px-ax)*dx+(py-ay)*dy)/len2));
+  return Math.hypot(px-(ax+t*dx), py-(ay+t*dy));
 }
 
-export default function SimulatorClient({ project, sprinklerDb, isOwner }: Props) {
-  const router  = useRouter();
-  const cvRef   = useRef<HTMLCanvasElement>(null);
-  const wRef    = useRef<HTMLCanvasElement>(null); // wet layer
-  const animRef = useRef<number|null>(null);
+// Min distance from interior point to any polygon edge (in meters)
+function distToEdge(xm:number,ym:number, polyM:{x:number,y:number}[]): number {
+  let min=Infinity;
+  for (let i=0;i<polyM.length;i++) {
+    const p1=polyM[i], p2=polyM[(i+1)%polyM.length];
+    min=Math.min(min, ptToSegDist(xm,ym,p1.x,p1.y,p2.x,p2.y));
+  }
+  return min;
+}
 
-  // ── Transform state ─────────────────────────────────────────
-  const [canvasSize, setCanvasSize] = useState({ w: 900, h: 600 });
-  const m2px  = useRef(1);
-  const ox    = useRef(0);
-  const oy    = useRef(0);
+// ════════════════════════════════════════════════════════════
+// PIPE ROUTING — Professional perimeter-following system
+//
+// Inspired by real irrigation designs:
+//   • SA placed on polygon perimeter (or nearest edge point)
+//   • Main pipe follows polygon perimeter to each zone valve
+//   • Lateral pipes branch perpendicular from main to each head
+//   • Flow rate = Σ(head flow) displayed on each segment
+// ════════════════════════════════════════════════════════════
 
-  // ── App state ────────────────────────────────────────────────
-  const [polygon,     setPolygon]     = useState<{x:number,y:number}[]>([]);
-  const [polyM,       setPolyM]       = useState<Point[]>(project.polygon ?? []);
-  const [polyClosed,  setPolyClosed]  = useState(project.polygon?.length >= 3);
-  const [sprinklers,  setSprinklers]  = useState<PlacedSprinkler[]>(
-    (project.sprinklers as PlacedSprinkler[]) ?? []
+// Project a point onto the nearest point on a polygon edge
+function nearestPerimeterPoint(
+  xm:number, ym:number,
+  polyM:{x:number,y:number}[]
+): {x:number,y:number,edgeIdx:number,t:number,dist:number} {
+  let best = {x:xm,y:ym,edgeIdx:0,t:0,dist:Infinity};
+  for (let i=0;i<polyM.length;i++){
+    const p1=polyM[i], p2=polyM[(i+1)%polyM.length];
+    const dx=p2.x-p1.x, dy=p2.y-p1.y, len2=dx*dx+dy*dy;
+    if (len2<0.0001) continue;
+    const t=Math.max(0,Math.min(1,((xm-p1.x)*dx+(ym-p1.y)*dy)/len2));
+    const px=p1.x+t*dx, py=p1.y+t*dy;
+    const d=Math.hypot(xm-px,ym-py);
+    if (d<best.dist) best={x:px,y:py,edgeIdx:i,t,dist:d};
+  }
+  return best;
+}
+
+// Walk perimeter from edge+t position by arc length, returning path points
+function walkPerimeter(
+  polyM:{x:number,y:number}[],
+  fromEdge:number, fromT:number,
+  toEdge:number,   toT:number,
+  clockwise:boolean
+): {x:number,y:number}[] {
+  const n = polyM.length;
+  const pts: {x:number,y:number}[] = [];
+
+  // Start point on edge
+  const p1s=polyM[fromEdge], p2s=polyM[(fromEdge+1)%n];
+  pts.push({x:p1s.x+(p2s.x-p1s.x)*fromT, y:p1s.y+(p2s.y-p1s.y)*fromT});
+
+  if (clockwise) {
+    let e = fromEdge;
+    while (true) {
+      const nextE = (e+1)%n;
+      if (nextE === toEdge) {
+        // Add end of this edge (= start of toEdge)
+        pts.push({x:polyM[nextE].x, y:polyM[nextE].y});
+        break;
+      }
+      if (e === toEdge) break;
+      pts.push({x:polyM[nextE].x, y:polyM[nextE].y});
+      e = nextE;
+      if (e === fromEdge) break; // full loop guard
+    }
+  } else {
+    let e = fromEdge;
+    while (true) {
+      if (e === toEdge) break;
+      pts.push({x:polyM[e].x, y:polyM[e].y});
+      e = (e-1+n)%n;
+      if (e === fromEdge) break;
+    }
+  }
+
+  // End point on toEdge
+  const p1t=polyM[toEdge], p2t=polyM[(toEdge+1)%n];
+  pts.push({x:p1t.x+(p2t.x-p1t.x)*toT, y:p1t.y+(p2t.y-p1t.y)*toT});
+
+  return pts;
+}
+
+// Perimeter distance between two edge positions
+function perimeterDist(
+  polyM:{x:number,y:number}[],
+  fromEdge:number, fromT:number,
+  toEdge:number,   toT:number,
+  clockwise:boolean
+): number {
+  const path = walkPerimeter(polyM, fromEdge, fromT, toEdge, toT, clockwise);
+  let d=0;
+  for(let i=1;i<path.length;i++) d+=Math.hypot(path[i].x-path[i-1].x, path[i].y-path[i-1].y);
+  return d;
+}
+
+// Nearest point on perimeter to a point (inset by insetM toward interior)
+function perimeterInset(
+  xm:number,ym:number,
+  polyM:{x:number,y:number}[],
+  insetM:number
+): {x:number,y:number,edgeIdx:number,t:number} {
+  const pp=nearestPerimeterPoint(xm,ym,polyM);
+  if(insetM<=0) return pp;
+  // Move inset toward the original point
+  const dx=xm-pp.x, dy=ym-pp.y, d=Math.hypot(dx,dy);
+  if(d<0.001) return pp;
+  const f=Math.min(insetM,d)/d;
+  return {...pp, x:pp.x+dx*f, y:pp.y+dy*f};
+}
+
+// Build complete pipe network
+function buildPipeNetwork(
+  sps: {xm:number,ym:number,circIdx:number}[],
+  source: {xm:number,ym:number},
+  polyM: {x:number,y:number}[],
+  nCircuits: number
+): Pipe[] {
+  if (!sps.length || polyM.length<3) return [];
+
+  const allPipes: Pipe[] = [];
+
+  // Group sprinklers by circuit, compute zone centroid
+  const groups: {xm:number,ym:number}[][] = Array.from({length:nCircuits}, ()=>[]);
+  sps.forEach(s => { if(s.circIdx<nCircuits) groups[s.circIdx].push({xm:s.xm,ym:s.ym}); });
+
+  // For each circuit: valve = nearest perimeter point to zone centroid
+  const valves: {x:number,y:number,edgeIdx:number,t:number,circIdx:number}[] = [];
+  groups.forEach((grp,ci)=>{
+    if(!grp.length) return;
+    const cx=grp.reduce((s,p)=>s+p.xm,0)/grp.length;
+    const cy=grp.reduce((s,p)=>s+p.ym,0)/grp.length;
+    const pp=nearestPerimeterPoint(cx,cy,polyM);
+    valves.push({...pp, circIdx:ci});
+  });
+  if(!valves.length) return [];
+
+  // SA position: snap to perimeter
+  const srcPP = nearestPerimeterPoint(source.xm, source.ym, polyM);
+  const srcOnPerim = {x:srcPP.x, y:srcPP.y, edgeIdx:srcPP.edgeIdx, t:srcPP.t};
+
+  // ── Main line: SA → each valve following perimeter ────────
+  // Order valves by clockwise perimeter distance from SA
+  const n=polyM.length;
+  function perimPos(edgeIdx:number,t:number): number {
+    // Perimeter position as linear measure from vertex 0
+    let pos=0;
+    for(let i=0;i<edgeIdx;i++) pos+=Math.hypot(polyM[(i+1)%n].x-polyM[i].x, polyM[(i+1)%n].y-polyM[i].y);
+    const p1=polyM[edgeIdx],p2=polyM[(edgeIdx+1)%n];
+    pos+=t*Math.hypot(p2.x-p1.x,p2.y-p1.y);
+    return pos;
+  }
+  const totalPerim=polyM.reduce((s,p,i)=>s+Math.hypot(p.x-polyM[(i+1)%n].x,p.y-polyM[(i+1)%n].y),0);
+  const srcPos=perimPos(srcOnPerim.edgeIdx,srcOnPerim.t);
+
+  // Sort valves by CW distance from SA
+  const sortedValves=[...valves].sort((a,b)=>{
+    const da=(perimPos(a.edgeIdx,a.t)-srcPos+totalPerim)%totalPerim;
+    const db=(perimPos(b.edgeIdx,b.t)-srcPos+totalPerim)%totalPerim;
+    return da-db;
+  });
+
+  // Build main line path: SA → V1 → V2 → ... following perimeter
+  const mainNodes=[
+    {x:srcOnPerim.x,y:srcOnPerim.y,edgeIdx:srcOnPerim.edgeIdx,t:srcOnPerim.t},
+    ...sortedValves
+  ];
+
+  for(let i=0;i<mainNodes.length-1;i++){
+    const from=mainNodes[i], to=mainNodes[i+1];
+    const pathPts=walkPerimeter(polyM, from.edgeIdx,from.t, to.edgeIdx,to.t, true);
+    for(let j=0;j<pathPts.length-1;j++){
+      const segLen=Math.hypot(pathPts[j+1].x-pathPts[j].x, pathPts[j+1].y-pathPts[j].y);
+      if(segLen<0.01) continue;
+      allPipes.push({
+        from:{x:pathPts[j].x,y:pathPts[j].y},
+        to:{x:pathPts[j+1].x,y:pathPts[j+1].y},
+        type:'main',
+        circIdx: sortedValves[Math.min(i,sortedValves.length-1)]?.circIdx ?? 0,
+        lengthM: segLen,
+      });
+    }
+  }
+
+  // ── Laterals: valve → each sprinkler (MST per circuit) ───
+  // Each lateral is a straight line from valve drop to head
+  // Uses a simple MST (Prim) rooted at valve
+  groups.forEach((grp,ci)=>{
+    if(!grp.length) return;
+    const valve=valves.find(v=>v.circIdx===ci);
+    if(!valve) return;
+
+    // Prim MST: nodes = [valve, ...heads]
+    const nodes=[{x:valve.x,y:valve.y},...grp.map(s=>({x:s.xm,y:s.ym}))];
+    const visited=new Set([0]);
+    while(visited.size<nodes.length){
+      let bestD=Infinity,bestFrom=-1,bestTo=-1;
+      visited.forEach(vi=>{
+        nodes.forEach((_,j)=>{
+          if(visited.has(j)) return;
+          const d=Math.hypot(nodes[vi].x-nodes[j].x,nodes[vi].y-nodes[j].y);
+          if(d<bestD){bestD=d;bestFrom=vi;bestTo=j;}
+        });
+      });
+      if(bestTo<0) break;
+      visited.add(bestTo);
+      allPipes.push({
+        from:{x:nodes[bestFrom].x,y:nodes[bestFrom].y},
+        to:{x:nodes[bestTo].x,y:nodes[bestTo].y},
+        type:'branch',
+        circIdx:ci,
+        lengthM:bestD,
+      });
+    }
+  });
+
+  return allPipes;
+}
+
+// ════════════════════════════════════════════════════════════
+// SPRINKLER TYPE LABEL  (#5)
+// ════════════════════════════════════════════════════════════
+function sprinklerTypeLabel(radius:number): {label:string, color:string} {
+  if (radius<=3)  return {label:'Spray fix',  color:'#4fc3f7'};
+  if (radius<=6)  return {label:'Spray rot.', color:'#81c784'};
+  if (radius<=10) return {label:'Jet rotor',  color:'#ffb74d'};
+  return              {label:'Impact',      color:'#f06292'};
+}
+
+// ════════════════════════════════════════════════════════════
+// INWARD NORMAL — for arc direction
+// ════════════════════════════════════════════════════════════
+// Inward normal of a polygon edge (points toward centroid)
+function inwardNormalOfEdge(
+  p1:{x:number,y:number}, p2:{x:number,y:number},
+  centX:number, centY:number
+): {nx:number, ny:number} {
+  const ex=p2.x-p1.x, ey=p2.y-p1.y;
+  const len=Math.hypot(ex,ey)||1;
+  let nx=-ey/len, ny=ex/len;
+  const midX=(p1.x+p2.x)/2, midY=(p1.y+p2.y)/2;
+  if ((centX-midX)*nx+(centY-midY)*ny < 0) { nx=-nx; ny=-ny; }
+  return {nx,ny};
+}
+
+// Compute arc for a sprinkler at (xm,ym) based on distance to polygon edges
+function computeArc(
+  xm:number, ym:number,
+  polyM:{x:number,y:number}[],
+  radius:number,
+  centX:number, centY:number
+): {sa:number, ea:number} {
+  const edgeThresh = radius * 0.65;
+  let dMin1=Infinity, dMin2=Infinity;
+  let norm1={nx:0,ny:1}, norm2={nx:1,ny:0};
+
+  for (let e=0; e<polyM.length; e++) {
+    const p1=polyM[e], p2=polyM[(e+1)%polyM.length];
+    const d=ptToSegDist(xm,ym,p1.x,p1.y,p2.x,p2.y);
+    const n=inwardNormalOfEdge(p1,p2,centX,centY);
+    if (d<dMin1) { dMin2=dMin1; norm2={...norm1}; dMin1=d; norm1=n; }
+    else if (d<dMin2) { dMin2=d; norm2=n; }
+  }
+
+  const near1 = dMin1 < edgeThresh;
+  const near2 = dMin2 < edgeThresh;
+
+  if (near1 && near2) {
+    // Corner: 90° arc bisecting two edge normals
+    const bx=norm1.nx+norm2.nx, by=norm1.ny+norm2.ny;
+    const bLen=Math.hypot(bx,by);
+    if (bLen>0.01) {
+      const angle = Math.atan2(by/bLen, bx/bLen)*180/Math.PI;
+      return { sa: ((angle-45)%360+360)%360, ea: ((angle+45)%360+360)%360 };
+    }
+  }
+  if (near1) {
+    // Edge: 180° pointing inward
+    const angle = Math.atan2(norm1.ny, norm1.nx)*180/Math.PI;
+    const sa = ((angle-90)%360+360)%360;
+    const ea = ((angle+90)%360+360)%360;
+    return { sa, ea };
+  }
+  // Interior: full 360°
+  return { sa:0, ea:360 };
+}
+
+// Scanline: find x-intersections of polygon at a given y (in meters)
+function scanlineX(y:number, polyM:{x:number,y:number}[]): number[] {
+  const xs: number[] = [];
+  for (let i=0; i<polyM.length; i++) {
+    const p1=polyM[i], p2=polyM[(i+1)%polyM.length];
+    if ((p1.y<=y && p2.y>y) || (p2.y<=y && p1.y>y)) {
+      const t=(y-p1.y)/(p2.y-p1.y);
+      xs.push(p1.x+t*(p2.x-p1.x));
+    }
+  }
+  return xs.sort((a,b)=>a-b);
+}
+
+// ════════════════════════════════════════════════════════════
+// PROFESSIONAL PLACEMENT — Scanline with proper pair segments
+//
+// FIX: scanline returns N intersection points per row.
+//   For convex shapes: 2 points → 1 segment
+//   For L/U/concave:  4+ points → multiple segments
+//   MUST use pairs [xs[0],xs[1]], [xs[2],xs[3]] — NOT xs[0] to xs[last]
+//
+// Arc direction: computed from nearest polygon edge (inward normal)
+// ════════════════════════════════════════════════════════════
+function professionalPlace(
+  polyM: {x:number,y:number}[],
+  radiusRequested: number,
+  nCircuits: number
+): Omit<PlacedSprinkler,'x'|'y'>[] {
+  if (polyM.length < 3) return [];
+
+  const bb   = bbox(polyM);
+  const W    = bb.maxX - bb.minX;
+  const H    = bb.maxY - bb.minY;
+  const centX = polyM.reduce((s,p)=>s+p.x,0)/polyM.length;
+  const centY = polyM.reduce((s,p)=>s+p.y,0)/polyM.length;
+
+  // Clamp radius to polygon size — never bigger than shortest dimension
+  const radius = Math.min(radiusRequested, Math.min(W,H) * 0.95);
+
+  const vStep = radius * 0.866; // equilateral triangle row height
+  const hStep = radius;         // head-to-head horizontal spacing
+
+  // Use CEIL so every part of the polygon gets coverage
+  const nRowsFit   = Math.max(1, Math.ceil(H / vStep));
+  const actualVStep = H / nRowsFit;
+
+  const placed: Omit<PlacedSprinkler,'x'|'y'>[] = [];
+  let id = 0;
+
+  for (let row = 0; row < nRowsFit; row++) {
+    const ym = bb.minY + (row + 0.5) * actualVStep;
+
+    // Scanline: get ALL intersection x-values at this y
+    const xs: number[] = [];
+    for (let e = 0; e < polyM.length; e++) {
+      const p1 = polyM[e], p2 = polyM[(e+1)%polyM.length];
+      if ((p1.y <= ym && p2.y > ym) || (p2.y <= ym && p1.y > ym)) {
+        const t = (ym - p1.y) / (p2.y - p1.y);
+        xs.push(p1.x + t * (p2.x - p1.x));
+      }
+    }
+    if (xs.length < 2) continue;
+    xs.sort((a, b) => a - b);
+
+    // Triangular hex offset on odd rows
+    const hexOffset = (nRowsFit > 1 && row % 2 === 1) ? hStep * 0.4 : 0;
+
+    // ── KEY FIX: iterate over PAIRS of intersections ──────
+    // For L/U/concave shapes: xs = [x0,x1, x2,x3, ...]
+    // Each pair [xs[i], xs[i+1]] is a solid segment of the polygon
+    for (let seg = 0; seg < xs.length - 1; seg += 2) {
+      const xLeft  = xs[seg];
+      const xRight = xs[seg + 1];
+      const rowW   = xRight - xLeft;
+      if (rowW <= 0) continue;
+
+      const nColsFit   = Math.max(1, Math.ceil(rowW / hStep));
+      const actualHStep = rowW / nColsFit;
+      // Only apply hex offset if the shifted point would stay within this segment
+      const safeHexOff = hexOffset < actualHStep * 0.4 ? hexOffset : 0;
+
+      for (let col = 0; col < nColsFit; col++) {
+        const xm = xLeft + (col + 0.5) * actualHStep + safeHexOff;
+
+        // Safety: confirm point is inside polygon
+        if (!pip({x:xm, y:ym}, polyM)) continue;
+
+        // Skip if too close to existing head
+        if (placed.some(p => Math.hypot(p.xm-xm, p.ym-ym) < hStep * 0.38)) continue;
+
+        // ── Arc: sample 8 directions, keep only those pointing INTO polygon ──
+        // This works correctly for L/U/concave shapes where centroid may be outside
+        const edgeThresh = radius * 0.6;
+
+        // Find distance to each polygon edge
+        const edgeDists: {d:number, nx:number, ny:number}[] = [];
+        for (let e = 0; e < polyM.length; e++) {
+          const p1=polyM[e], p2=polyM[(e+1)%polyM.length];
+          const d=ptToSegDist(xm,ym,p1.x,p1.y,p2.x,p2.y);
+          // Normal of edge
+          const ex2=p2.x-p1.x, ey2=p2.y-p1.y, len=Math.hypot(ex2,ey2)||1;
+          let nx=-ey2/len, ny=ex2/len;
+          // Flip to point INWARD: the inward direction is the one where
+          // (point + small_step) stays inside polygon
+          const testX=xm+nx*0.1, testY=ym+ny*0.1;
+          if (!pip({x:testX,y:testY}, polyM)) { nx=-nx; ny=-ny; }
+          edgeDists.push({d, nx, ny});
+        }
+        edgeDists.sort((a,b)=>a.d-b.d);
+
+        const near = edgeDists.filter(e => e.d < edgeThresh);
+        let sa=0, ea=360;
+
+        if (near.length >= 2) {
+          // Corner: average the two closest inward normals → 90° arc
+          const bx=near[0].nx+near[1].nx, by=near[0].ny+near[1].ny;
+          const bLen=Math.hypot(bx,by);
+          if(bLen>0.01){
+            const angle=Math.atan2(by/bLen,bx/bLen)*180/Math.PI;
+            sa=((angle-45)%360+360)%360;
+            ea=((angle+45)%360+360)%360;
+          }
+        } else if (near.length === 1) {
+          // Edge: 180° pointing inward (perpendicular to edge, toward interior)
+          const angle=Math.atan2(near[0].ny,near[0].nx)*180/Math.PI;
+          sa=((angle-90)%360+360)%360;
+          ea=((angle+90)%360+360)%360;
+        }
+        // Interior (near.length===0): stays 360°
+
+        placed.push({
+          id: id++,
+          xm, ym, radius,
+          circIdx: id % nCircuits,
+          startA: sa,
+          endA:   ea,
+          phase:  Math.random(),
+        });
+      }
+    }
+  }
+
+  return placed;
+}
+// ════════════════════════════════════════════════════════════
+// COMPONENT
+// ════════════════════════════════════════════════════════════
+export default function SimulatorClient({project,sprinklerDb,isOwner}:Props) {
+  const cvRef  = useRef<HTMLCanvasElement>(null);
+  const wRef   = useRef<HTMLCanvasElement>(null);
+  const animRef= useRef<number|null>(null);
+
+  const m2pxR = useRef(40);
+  const oxR   = useRef(0);
+  const oyR   = useRef(0);
+  const [sz,  setSz]   = useState({w:900,h:600});
+
+  // Polygon — stored in meters, rendered in canvas px
+  const [polyM,      setPolyM]      = useState<Point[]>(project.polygon??[]);
+  const [polygon,    setPolygon]    = useState<{x:number,y:number}[]>([]);
+  const [polyClosed, setPolyClosed] = useState((project.polygon?.length??0)>=3);
+  const [drawPt,     setDrawPt]     = useState<{x:number,y:number}|null>(null); // live cursor while drawing
+
+  // Sprinklers & pipes
+  const [sprinklers, setSprinklers] = useState<PlacedSprinkler[]>(
+    (project.sprinklers as PlacedSprinkler[])??[]
   );
-  const [pipes,       setPipes]       = useState<Pipe[]>([]);
-  const [manualPipes, setManualPipes] = useState<ManualPipe[]>([]);
-  const [pipeMode,    setPipeMode]    = useState<'auto'|'manual'>('auto');
-  const [mode,        setMode]        = useState<'draw'|'add'|'move'|'delete'|'pipe'>('add');
-  const [selCirc,     setSelCirc]     = useState(0);
-  const [curRadius,   setCurRadius]   = useState(6);
-  const [selSp,       setSelSp]       = useState('');
-  const [hovSp,       setHovSp]       = useState<number|null>(null);
-  const [dragging,    setDragging]    = useState<{i:number,ox:number,oy:number}|null>(null);
-  const [animOn,      setAnimOn]      = useState(false);
-  const [activeCircs, setActiveCircs] = useState<Set<number>>(new Set());
-  const [speed,       setSpeed]       = useState(1);
-  const [saving,      setSaving]      = useState(false);
-  const [saved,       setSaved]       = useState(false);
-  const [activeTab,   setActiveTab]   = useState<'sim'|'pipes'|'report'>('sim');
-  const [msg,         setMsg]         = useState('Apasă "⚡ Plasează automat" sau adaugă aspersoare manual');
-  const [pipePts,     setPipePts]     = useState<{x:number,y:number}[]>([]);
+  const [pipes,  setPipes]  = useState<Pipe[]>([]);
 
-  // Refs for animation
-  const sprRef    = useRef(sprinklers);
-  const circRef   = useRef(project.circuits);
-  const animT0    = useRef<number|null>(null);
-  const lastSecT  = useRef<number|null>(null);
-  const totalSec  = useRef(0);
-  const particles = useRef<any[]>([]);
+  // Water source — drag & drop (#12)
+  const [waterSrc,    setWaterSrc]    = useState<WaterSource|null>(null);
+  const [draggingWS,  setDraggingWS]  = useState(false);
+  const [wsMode,      setWsMode]      = useState(false); // dedicated water source placement mode
+  const [placingWS,   setPlacingWS]   = useState(false); // click-to-place water source mode
 
-  useEffect(() => { sprRef.current = sprinklers; }, [sprinklers]);
+  // UI state
+  const [mode,       setMode]       = useState<'draw'|'add'|'move'|'delete'>('add');
+  const [selCirc,    setSelCirc]    = useState(0);
+  const [curRadius,  setCurRadius]  = useState(6);
+  const [hovSp,      setHovSp]      = useState<number|null>(null);
+  const [draggingSp, setDraggingSp] = useState<{i:number,ox:number,oy:number}|null>(null);
+  const [animOn,     setAnimOn]     = useState(false);
+  const [speed,      setSpeed]      = useState(1);
+  const [saving,     setSaving]     = useState(false);
+  const [saved,      setSaved]      = useState(false);
+  const [activeTab,  setActiveTab]  = useState<'sim'|'pipes'|'report'>('sim');
+  const [msg,        setMsg]        = useState('⚡ Apasă Automat sau desenează forma cu ✏️');
+  const [coverage,   setCoverage]   = useState(0);
+  const [showPDF,    setShowPDF]    = useState(false); // #13
 
-  // ── Scale computation ────────────────────────────────────────
-  const computeScale = useCallback((w: number, h: number) => {
-    const L = project.length_m, W = project.width_m;
-    const sx = (w * 0.78) / Math.max(L, 0.1);
-    const sy = (h * 0.80) / Math.max(W, 0.1);
-    m2px.current = Math.min(sx, sy);
-    ox.current = (w - L * m2px.current) / 2;
-    oy.current = (h - W * m2px.current) / 2;
-  }, [project.length_m, project.width_m]);
+  const sprRef   = useRef(sprinklers);
+  const circRef  = useRef(project.circuits);
+  const polyMRef = useRef(polyM);
+  const animT0  = useRef<number|null>(null);
+  const parts   = useRef<any[]>([]);
 
-  function toCanvas(xm: number, ym: number) {
-    return { x: ox.current + xm * m2px.current, y: oy.current + ym * m2px.current };
-  }
-  function toMeters(xc: number, yc: number): Point {
-    return { x: (xc - ox.current) / m2px.current, y: (yc - oy.current) / m2px.current };
-  }
+  useEffect(()=>{sprRef.current=sprinklers;},[sprinklers]);
+  useEffect(()=>{polyMRef.current=polyM;},[polyM]);
 
-  // ── Resize observer ──────────────────────────────────────────
-  useEffect(() => {
-    const el = cvRef.current?.parentElement;
-    if (!el) return;
-    const ro = new ResizeObserver(([e]) => {
-      const w = e.contentRect.width;
-      const h = e.contentRect.height;
-      setCanvasSize({ w, h });
-      computeScale(w, h);
+  // ── Scale ─────────────────────────────────────────────────
+  const computeScale = useCallback((w:number,h:number,poly:Point[]) => {
+    const pad=0.82;
+    if (poly.length<2) {
+      const L=project.length_m||20, H2=project.width_m||10;
+      const sc=Math.min((w*pad)/L,(h*pad)/H2);
+      m2pxR.current=sc; oxR.current=(w-L*sc)/2; oyR.current=(h-H2*sc)/2; return;
+    }
+    const bb=bbox(poly);
+    const W=bb.maxX-bb.minX||1, H2=bb.maxY-bb.minY||1;
+    const sc=Math.min((w*pad)/W,(h*pad)/H2);
+    m2pxR.current=sc;
+    oxR.current=w/2-(bb.minX+W/2)*sc;
+    oyR.current=h/2-(bb.minY+H2/2)*sc;
+  },[project.length_m,project.width_m]);
+
+  const toC = useCallback((xm:number,ym:number)=>
+    ({x:oxR.current+xm*m2pxR.current, y:oyR.current+ym*m2pxR.current}),[]);
+  const toM = useCallback((xc:number,yc:number):Point=>
+    ({x:(xc-oxR.current)/m2pxR.current, y:(yc-oyR.current)/m2pxR.current}),[]);
+
+  // ── Resize ────────────────────────────────────────────────
+  useEffect(()=>{
+    const el=cvRef.current?.parentElement; if(!el) return;
+    const ro=new ResizeObserver(([e])=>{
+      const w=e.contentRect.width,h=e.contentRect.height;
+      setSz({w,h}); computeScale(w,h,polyM);
     });
     ro.observe(el);
-    computeScale(el.clientWidth, el.clientHeight);
-    setCanvasSize({ w: el.clientWidth, h: el.clientHeight });
-    return () => ro.disconnect();
-  }, [computeScale]);
+    computeScale(el.clientWidth,el.clientHeight,polyM);
+    setSz({w:el.clientWidth,h:el.clientHeight});
+    return ()=>ro.disconnect();
+  },[computeScale,polyM]);
 
-  // ── Sync polygon canvas↔meters ───────────────────────────────
-  useEffect(() => {
-    setPolygon(polyM.map(p => toCanvas(p.x, p.y)));
-  }, [polyM, canvasSize]);
+  // Recompute canvas coords when polyM or size changes (#1)
+  useEffect(()=>{
+    computeScale(sz.w,sz.h,polyM);
+    setPolygon(polyM.map(p=>toC(p.x,p.y)));
+    setSprinklers(prev=>prev.map(s=>{const c=toC(s.xm,s.ym);return{...s,x:c.x,y:c.y};}));
+    if (waterSrc) {
+      const c=toC(waterSrc.xm,waterSrc.ym);
+      setWaterSrc(w=>w?{...w,x:c.x,y:c.y}:null);
+    }
+  },[polyM,sz]);
 
-  // Also sync sprinkler canvas positions when scale changes
-  useEffect(() => {
-    setSprinklers(prev => prev.map(s => {
-      const c = toCanvas(s.xm, s.ym);
-      return { ...s, x: c.x, y: c.y };
-    }));
-  }, [canvasSize]);
+  // ── Pipes from water source (#12) ─────────────────────────
+  const recalcPipes = useCallback((sps:PlacedSprinkler[], ws:WaterSource|null)=>{
+    if (!sps.length){setPipes([]);return;}
+    const origin = ws ?? {
+      xm: polyM.reduce((s,p)=>s+p.x,0)/Math.max(polyM.length,1),
+      ym: polyM.reduce((s,p)=>s+p.y,0)/Math.max(polyM.length,1)
+    };
+    const result = buildPipeNetwork(sps, origin, polyM, project.circuits.length);
+    setPipes(result);
+  },[polyM,project.circuits]);
 
-  // ── Pipe calculation ─────────────────────────────────────────
-  const calcPipes = useCallback((sps: PlacedSprinkler[]) => {
-    if (pipeMode === 'manual' || sps.length === 0) { setPipes([]); return; }
-    const centX = polygon.reduce((s,p)=>s+p.x,0)/Math.max(polygon.length,1);
-    const centY = polygon.reduce((s,p)=>s+p.y,0)/Math.max(polygon.length,1);
-    const centM = toMeters(centX, centY);
-    const allPipes: Pipe[] = [];
-    project.circuits.forEach((_, ci) => {
-      const group = sps.filter(s => s.circIdx === ci);
-      if (!group.length) return;
-      const nodes = [centM, ...group.map(s=>({x:s.xm, y:s.ym}))];
-      allPipes.push(...buildMST(nodes, ci, 'main'));
-    });
-    setPipes(allPipes);
-  }, [pipeMode, polygon, project.circuits]);
+  // ── Coverage ──────────────────────────────────────────────
+  const recalcCov = useCallback((sps:PlacedSprinkler[])=>{
+    if (!polyClosed||!polyM.length||!sps.length){setCoverage(0);return;}
+    const bb=bbox(polyM); const N=60;
+    const dx=(bb.maxX-bb.minX)/N, dy=(bb.maxY-bb.minY)/N;
+    let ins=0,cov=0;
+    for (let i=0;i<N;i++) for (let j=0;j<N;j++){
+      const px=bb.minX+(i+0.5)*dx, py=bb.minY+(j+0.5)*dy;
+      if (!pip({x:px,y:py},polyM)) continue;
+      ins++;
+      if (sps.some(sp=>Math.hypot((oxR.current+px*m2pxR.current)-sp.x,
+                                   (oyR.current+py*m2pxR.current)-sp.y)<=sp.radius*m2pxR.current)) cov++;
+    }
+    setCoverage(ins>0?Math.round(cov/ins*100):0);
+  },[polyClosed,polyM]);
 
-  // ── Draw ─────────────────────────────────────────────────────
-  useEffect(() => {
-    const cv = cvRef.current;
-    if (!cv) return;
-    const ctx = cv.getContext('2d')!;
-    const { w, h } = canvasSize;
-    ctx.clearRect(0, 0, w, h);
-    drawGrid(ctx, w, h);
-    if (polygon.length > 0) drawPoly(ctx);
-    drawPipesLayer(ctx);
-    drawSprinklersLayer(ctx);
-  }, [polygon, polyClosed, sprinklers, pipes, manualPipes, hovSp, canvasSize, animOn]);
+  // ── Draw ──────────────────────────────────────────────────
+  useEffect(()=>{
+    const cv=cvRef.current; if(!cv) return;
+    const ctx=cv.getContext('2d')!;
+    ctx.clearRect(0,0,sz.w,sz.h);
+    drawGrid(ctx);
+    if (polygon.length>0) drawPoly(ctx);
+    if (activeTab==='pipes') drawPipesLayer(ctx);
+    drawHeads(ctx);
+    if (waterSrc) drawWaterSrc(ctx, waterSrc);
+  },[polygon,polyClosed,sprinklers,pipes,hovSp,sz,animOn,activeTab,waterSrc,drawPt,mode]);
 
-  function drawGrid(ctx: CanvasRenderingContext2D, w: number, h: number) {
+  function drawGrid(ctx:CanvasRenderingContext2D) {
+    const step=m2pxR.current; if(step<4) return;
     ctx.save();
-    const step = m2px.current;
-    if (step < 6) { ctx.restore(); return; }
-    ctx.strokeStyle = 'rgba(255,255,255,0.03)'; ctx.lineWidth = 1;
-    for (let x = ox.current % step; x < w; x += step) { ctx.beginPath(); ctx.moveTo(x,0); ctx.lineTo(x,h); ctx.stroke(); }
-    for (let y = oy.current % step; y < h; y += step) { ctx.beginPath(); ctx.moveTo(0,y); ctx.lineTo(w,y); ctx.stroke(); }
+    ctx.strokeStyle='rgba(255,255,255,0.03)'; ctx.lineWidth=1;
+    for(let x=((oxR.current%step)+step)%step;x<sz.w;x+=step){ctx.beginPath();ctx.moveTo(x,0);ctx.lineTo(x,sz.h);ctx.stroke();}
+    for(let y=((oyR.current%step)+step)%step;y<sz.h;y+=step){ctx.beginPath();ctx.moveTo(0,y);ctx.lineTo(sz.w,y);ctx.stroke();}
+    // #4 — meter labels on both axes
+    ctx.fillStyle='rgba(168,216,170,0.4)'; ctx.font='9px monospace'; ctx.textAlign='center';
+    const maxX=Math.ceil(sz.w/step)+1, maxY=Math.ceil(sz.h/step)+1;
+    for(let m=0;m<=maxX*2;m+=5){
+      const cx=oxR.current+m*m2pxR.current;
+      if(cx<0||cx>sz.w) continue;
+      ctx.fillText(m+'m',cx,oyR.current-8);
+    }
+    ctx.textAlign='right';
+    for(let m=0;m<=maxY*2;m+=5){
+      const cy=oyR.current+m*m2pxR.current;
+      if(cy<0||cy>sz.h) continue;
+      ctx.fillText(m+'m',oxR.current-6,cy+3);
+    }
     ctx.restore();
   }
 
-  function drawPoly(ctx: CanvasRenderingContext2D) {
+  function drawPoly(ctx:CanvasRenderingContext2D) {
     ctx.save();
     ctx.beginPath();
-    polygon.forEach((p,i) => i===0 ? ctx.moveTo(p.x,p.y) : ctx.lineTo(p.x,p.y));
+    polygon.forEach((p,i)=>i===0?ctx.moveTo(p.x,p.y):ctx.lineTo(p.x,p.y));
+
     if (polyClosed) {
       ctx.closePath();
-      const bb = bbox(polygon);
-      const gr = ctx.createLinearGradient(0, bb.minY, 0, bb.maxY);
-      gr.addColorStop(0, 'rgba(46,125,50,0.7)'); gr.addColorStop(1, 'rgba(27,94,32,0.7)');
-      ctx.fillStyle = gr; ctx.fill();
-      ctx.strokeStyle = '#5cb85c'; ctx.lineWidth = 2; ctx.stroke();
-      // Dimension labels
-      const centX = (bb.minX+bb.maxX)/2, centY = (bb.minY+bb.maxY)/2;
-      const wM = ((bb.maxX-bb.minX)/m2px.current).toFixed(1);
-      const hM = ((bb.maxY-bb.minY)/m2px.current).toFixed(1);
-      ctx.fillStyle = 'rgba(168,216,170,0.7)'; ctx.font = 'bold 11px monospace'; ctx.textAlign = 'center';
-      ctx.fillText(`${wM}m`, centX, bb.minY - 8);
-      ctx.save(); ctx.translate(bb.minX - 14, centY); ctx.rotate(-Math.PI/2);
-      ctx.fillText(`${hM}m`, 0, 0); ctx.restore();
+      const bb2=bbox(polygon);
+      const gr=ctx.createLinearGradient(0,bb2.minY,0,bb2.maxY);
+      gr.addColorStop(0,'rgba(46,125,50,0.6)'); gr.addColorStop(1,'rgba(20,80,20,0.6)');
+      ctx.fillStyle=gr; ctx.fill();
+      ctx.strokeStyle='#5cb85c'; ctx.lineWidth=2; ctx.stroke();
+
+      // Dimension labels on polygon centroid
+      const cx=polygon.reduce((s,p)=>s+p.x,0)/polygon.length;
+      const cy=polygon.reduce((s,p)=>s+p.y,0)/polygon.length;
+      const bb3=bbox(polyM);
+      const wM=(bb3.maxX-bb3.minX).toFixed(1), hM=(bb3.maxY-bb3.minY).toFixed(1);
+      ctx.fillStyle='rgba(168,216,170,0.9)'; ctx.font='bold 13px monospace'; ctx.textAlign='center';
+      ctx.fillText(wM+'m', cx, bb2.minY-12);
+      ctx.save(); ctx.translate(bb2.minX-20,cy); ctx.rotate(-Math.PI/2);
+      ctx.fillText(hM+'m',0,0); ctx.restore();
+      // Area
+      const area=polyAreaM(polyM).toFixed(0);
+      ctx.fillStyle='rgba(168,216,170,0.5)'; ctx.font='11px monospace';
+      ctx.fillText(area+' m²',cx,cy);
     } else {
-      ctx.strokeStyle = 'rgba(92,184,92,0.5)'; ctx.lineWidth = 2;
+      ctx.strokeStyle='rgba(92,184,92,0.5)'; ctx.lineWidth=2;
       ctx.setLineDash([8,5]); ctx.stroke(); ctx.setLineDash([]);
+      // Live preview line to cursor
+      if (drawPt&&polygon.length>0) {
+        const last=polygon[polygon.length-1];
+        ctx.strokeStyle='rgba(92,184,92,0.25)'; ctx.lineWidth=1.5;
+        ctx.setLineDash([4,4]);
+        ctx.beginPath(); ctx.moveTo(last.x,last.y); ctx.lineTo(drawPt.x,drawPt.y); ctx.stroke();
+        ctx.setLineDash([]);
+      }
     }
-    polygon.forEach((p,i) => {
-      ctx.beginPath(); ctx.arc(p.x, p.y, 5, 0, Math.PI*2);
-      ctx.fillStyle = i===0 && polygon.length>2 ? '#FF9800' : '#5cb85c';
-      ctx.fill(); ctx.strokeStyle = 'rgba(255,255,255,0.6)'; ctx.lineWidth = 1.5; ctx.stroke();
+
+    // Vertices
+    polygon.forEach((p,i)=>{
+      ctx.beginPath(); ctx.arc(p.x,p.y,5,0,Math.PI*2);
+      ctx.fillStyle=i===0&&polygon.length>2?'#FF9800':'#5cb85c';
+      ctx.fill(); ctx.strokeStyle='rgba(255,255,255,0.6)'; ctx.lineWidth=1.5; ctx.stroke();
+      // Segment length labels
+      if (i>0&&polyClosed||i>0) {
+        const prev=polygon[i-1];
+        const lm=Math.hypot(p.x-prev.x,p.y-prev.y)/m2pxR.current;
+        if(lm>0.5){
+          ctx.fillStyle='rgba(200,240,160,0.6)'; ctx.font='8px monospace'; ctx.textAlign='center';
+          ctx.fillText(lm.toFixed(1)+'m',(p.x+prev.x)/2,(p.y+prev.y)/2-6);
+        }
+      }
     });
     ctx.restore();
   }
 
-  function drawPipesLayer(ctx: CanvasRenderingContext2D) {
-    if (activeTab === 'sim') return;
-    pipes.forEach(p => {
-      const circ = project.circuits[p.circIdx];
-      const color = p.type==='main' ? '#f0c040' : (circ?.color ?? '#e07020');
-      const from = toCanvas(p.from.x, p.from.y);
-      const to   = toCanvas(p.to.x,   p.to.y);
+  function drawWaterSrc(ctx:CanvasRenderingContext2D, ws:WaterSource) {
+    ctx.save();
+    ctx.beginPath(); ctx.arc(ws.x,ws.y,12,0,Math.PI*2);
+    ctx.fillStyle='rgba(0,100,200,0.85)'; ctx.fill();
+    ctx.strokeStyle='#60b8ff'; ctx.lineWidth=2.5; ctx.stroke();
+    ctx.fillStyle='white'; ctx.font='bold 12px sans-serif'; ctx.textAlign='center';
+    ctx.fillText('💧',ws.x,ws.y+4);
+    ctx.fillStyle='rgba(100,200,255,0.8)'; ctx.font='8px monospace';
+    ctx.fillText('Sursă apă',ws.x,ws.y+22);
+    ctx.restore();
+  }
+
+  function drawPipesLayer(ctx:CanvasRenderingContext2D) {
+    const FLOW_PER_HEAD = 0.45; // m³/h per sprinkler head (typical)
+
+    // ── 1. Draw polygon outline (light, background) ──────────
+    if (polyM.length > 2) {
       ctx.save();
-      ctx.strokeStyle = color + 'aa'; ctx.lineWidth = p.type==='main' ? 3 : 2;
-      ctx.setLineDash(p.type==='main' ? [] : [5,3]); ctx.lineCap = 'round';
-      ctx.beginPath(); ctx.moveTo(from.x, from.y); ctx.lineTo(to.x, to.y); ctx.stroke();
+      ctx.strokeStyle='rgba(100,200,100,0.25)'; ctx.lineWidth=1;
+      ctx.setLineDash([4,4]);
+      const pts=polygon;
+      ctx.beginPath(); ctx.moveTo(pts[0].x,pts[0].y);
+      pts.forEach(p=>ctx.lineTo(p.x,p.y)); ctx.closePath(); ctx.stroke();
       ctx.setLineDash([]);
-      if (p.lengthM > 0.5) {
-        const mx = (from.x+to.x)/2, my = (from.y+to.y)/2;
-        ctx.fillStyle = 'rgba(200,240,160,0.7)'; ctx.font = '8px monospace'; ctx.textAlign = 'center';
-        ctx.fillText(p.lengthM.toFixed(1)+'m', mx, my-4);
+      ctx.restore();
+    }
+
+    // ── 2. Lateral pipes (circuit color, thin) ───────────────
+    pipes.filter(p=>p.type==='branch').forEach(p=>{
+      const circ=project.circuits[p.circIdx];
+      const color=circ?.color??'#4fc3f7';
+      const from=toC(p.from.x,p.from.y), to2=toC(p.to.x,p.to.y);
+      ctx.save();
+      // shadow
+      ctx.strokeStyle='rgba(0,0,0,0.3)'; ctx.lineWidth=3; ctx.lineCap='round';
+      ctx.beginPath(); ctx.moveTo(from.x+1,from.y+1); ctx.lineTo(to2.x+1,to2.y+1); ctx.stroke();
+      // line
+      ctx.strokeStyle=color; ctx.lineWidth=1.8;
+      ctx.beginPath(); ctx.moveTo(from.x,from.y); ctx.lineTo(to2.x,to2.y); ctx.stroke();
+      // length tag
+      if(p.lengthM>0.8){
+        const mx=(from.x+to2.x)/2, my=(from.y+to2.y)/2;
+        const angle=Math.atan2(to2.y-from.y,to2.x-from.x);
+        ctx.translate(mx,my); ctx.rotate(angle);
+        ctx.fillStyle=color+'dd'; ctx.font='6px monospace'; ctx.textAlign='center';
+        ctx.fillText(p.lengthM.toFixed(1)+'m',0,-3);
+        ctx.restore(); return;
       }
       ctx.restore();
     });
-    // Supply point
-    if (pipes.length > 0) {
-      const cx = polygon.reduce((s,p)=>s+p.x,0)/Math.max(polygon.length,1);
-      const cy = polygon.reduce((s,p)=>s+p.y,0)/Math.max(polygon.length,1);
+
+    // ── 3. Main pipe (black outline + yellow fill) ───────────
+    // Group consecutive main pipes by circuit for flow labeling
+    const mainGroups: {[ci:number]: Pipe[]} = {};
+    pipes.filter(p=>p.type==='main').forEach(p=>{
+      if(!mainGroups[p.circIdx]) mainGroups[p.circIdx]=[];
+      mainGroups[p.circIdx].push(p);
+    });
+
+    pipes.filter(p=>p.type==='main').forEach(p=>{
+      const from=toC(p.from.x,p.from.y), to2=toC(p.to.x,p.to.y);
       ctx.save();
-      ctx.beginPath(); ctx.arc(cx, cy, 7, 0, Math.PI*2);
-      ctx.fillStyle = '#f0c040'; ctx.fill();
-      ctx.strokeStyle = 'white'; ctx.lineWidth = 1.5; ctx.stroke();
+      ctx.lineCap='round'; ctx.lineJoin='round';
+      // Black outline
+      ctx.strokeStyle='#0d0d0d'; ctx.lineWidth=5.5;
+      ctx.beginPath(); ctx.moveTo(from.x,from.y); ctx.lineTo(to2.x,to2.y); ctx.stroke();
+      // Yellow core
+      ctx.strokeStyle='#f0c040'; ctx.lineWidth=3;
+      ctx.beginPath(); ctx.moveTo(from.x,from.y); ctx.lineTo(to2.x,to2.y); ctx.stroke();
       ctx.restore();
-    }
+    });
+
+    // Flow labels on main pipe (one per circuit group, at midpoint)
+    Object.entries(mainGroups).forEach(([ciStr,segs])=>{
+      const ci=parseInt(ciStr);
+      const nHeads=sprinklers.filter(s=>s.circIdx===ci).length;
+      const flow=(nHeads*FLOW_PER_HEAD).toFixed(2);
+      // Find midpoint of all segs
+      if(!segs.length) return;
+      const mid=segs[Math.floor(segs.length/2)];
+      const from=toC(mid.from.x,mid.from.y), to2=toC(mid.to.x,mid.to.y);
+      const mx=(from.x+to2.x)/2, my=(from.y+to2.y)/2;
+      ctx.save();
+      // Background pill
+      ctx.fillStyle='rgba(10,20,10,0.82)';
+      ctx.beginPath(); ctx.roundRect(mx-28,my-10,56,14,4); ctx.fill();
+      ctx.fillStyle='#f0c040'; ctx.font='bold 7.5px monospace'; ctx.textAlign='center';
+      ctx.fillText('D='+flow+'m³/h', mx, my+1);
+      ctx.restore();
+    });
+
+    // ── 4. Valve nodes (perimeter, orange-ish) ───────────────
+    const groups:{xm:number,ym:number}[][]=Array.from({length:project.circuits.length},()=>[]);
+    sprinklers.forEach(s=>{ if(s.circIdx<project.circuits.length) groups[s.circIdx].push({xm:s.xm,ym:s.ym}); });
+    groups.forEach((grp,ci)=>{
+      if(!grp.length) return;
+      const cx=grp.reduce((s,p)=>s+p.xm,0)/grp.length;
+      const cy=grp.reduce((s,p)=>s+p.ym,0)/grp.length;
+      const pp=nearestPerimeterPoint(cx,cy,polyM);
+      const vc=toC(pp.x,pp.y);
+      const circ=project.circuits[ci];
+      const color=circ?.color??'#ff9800';
+      ctx.save();
+      // Glow
+      ctx.shadowBlur=8; ctx.shadowColor=color;
+      ctx.beginPath(); ctx.arc(vc.x,vc.y,7,0,Math.PI*2);
+      ctx.fillStyle='#111'; ctx.fill();
+      ctx.strokeStyle=color; ctx.lineWidth=2.5; ctx.stroke();
+      ctx.shadowBlur=0;
+      // Inner fill
+      ctx.beginPath(); ctx.arc(vc.x,vc.y,3.5,0,Math.PI*2);
+      ctx.fillStyle=color; ctx.fill();
+      // Circuit number label
+      ctx.fillStyle='white'; ctx.font='bold 6px sans-serif'; ctx.textAlign='center';
+      ctx.fillText(''+(ci+1), vc.x, vc.y+2.5);
+      ctx.restore();
+    });
+
+    // ── 5. Sprinkler heads (simplified for pipe view) ────────
+    sprinklers.forEach(sp=>{
+      const circ=project.circuits[sp.circIdx]; if(!circ) return;
+      if(!sp.x||!sp.y||!isFinite(sp.x)||!isFinite(sp.y)){
+        const c=toC(sp.xm,sp.ym); sp={...sp,x:c.x,y:c.y};
+      }
+      ctx.save();
+      // Small dot
+      ctx.beginPath(); ctx.arc(sp.x,sp.y,4.5,0,Math.PI*2);
+      ctx.fillStyle='#111'; ctx.fill();
+      ctx.strokeStyle=circ.color; ctx.lineWidth=2;
+      ctx.beginPath(); ctx.arc(sp.x,sp.y,4,0,Math.PI*2); ctx.stroke();
+      ctx.beginPath(); ctx.arc(sp.x,sp.y,1.5,0,Math.PI*2);
+      ctx.fillStyle=circ.color; ctx.fill();
+      ctx.restore();
+    });
+
+    // ── 6. SA — water source ─────────────────────────────────
+    const srcM=waterSrc??{
+      xm:polyM.reduce((s,p)=>s+p.x,0)/Math.max(polyM.length,1),
+      ym:polyM.reduce((s,p)=>s+p.y,0)/Math.max(polyM.length,1)
+    };
+    const pp=nearestPerimeterPoint(srcM.xm,srcM.ym,polyM);
+    const srcC=toC(pp.x,pp.y);
+    ctx.save();
+    ctx.shadowBlur=12; ctx.shadowColor='#90caf9';
+    // White box (like in reference image)
+    const bw=30,bh=22;
+    ctx.fillStyle='white'; ctx.strokeStyle='#1565c0'; ctx.lineWidth=2;
+    ctx.beginPath(); ctx.roundRect(srcC.x-bw/2,srcC.y-bh/2,bw,bh,4);
+    ctx.fill(); ctx.stroke();
+    ctx.shadowBlur=0;
+    ctx.fillStyle='#1565c0'; ctx.font='bold 9px sans-serif'; ctx.textAlign='center';
+    ctx.fillText('SA', srcC.x, srcC.y+3.5);
+    ctx.restore();
   }
 
-  function drawSprinklersLayer(ctx: CanvasRenderingContext2D) {
-    sprinklers.forEach((sp, i) => {
-      const circ = project.circuits[sp.circIdx];
-      if (!circ) return;
-      const r = sp.radius * m2px.current;
-      const isHov = hovSp === i;
-      // Coverage arc (static)
-      if (!animOn) {
-        const span = ((sp.endA - sp.startA) + 360) % 360 || 360;
+  function drawHeads(ctx:CanvasRenderingContext2D) {
+    sprinklers.forEach((sp,i)=>{
+      const circ=project.circuits[sp.circIdx]; if(!circ) return;
+
+      // Guard: recompute canvas coords from meters if x/y missing or NaN
+      if (!sp.x || !sp.y || !isFinite(sp.x) || !isFinite(sp.y)) {
+        const c = toC(sp.xm, sp.ym);
+        sp = { ...sp, x: c.x, y: c.y };
+      }
+
+      const r=Math.max(1, sp.radius*m2pxR.current);
+      const isHov=hovSp===i;
+      const span=((sp.endA-sp.startA)+360)%360||360;
+      const {label:tLabel}=sprinklerTypeLabel(sp.radius); // #5
+
+      if(!animOn){
+        const a1=sp.startA*Math.PI/180, a2=(sp.startA+span)*Math.PI/180;
+        const gr=ctx.createRadialGradient(sp.x,sp.y,0,sp.x,sp.y,r);
+        gr.addColorStop(0,circ.color+'66');
+        gr.addColorStop(0.6,circ.color+'33');
+        gr.addColorStop(1,circ.color+'00');
         ctx.save();
-        ctx.beginPath(); ctx.moveTo(sp.x, sp.y);
-        ctx.arc(sp.x, sp.y, r, sp.startA*Math.PI/180, (sp.startA+span)*Math.PI/180);
-        ctx.closePath();
-        ctx.fillStyle = circ.color + '22'; ctx.fill();
-        ctx.strokeStyle = circ.color + '55'; ctx.lineWidth = 1;
-        ctx.setLineDash([3,3]); ctx.stroke(); ctx.setLineDash([]);
+        ctx.beginPath(); ctx.moveTo(sp.x,sp.y); ctx.arc(sp.x,sp.y,r,a1,a2); ctx.closePath();
+        ctx.fillStyle=gr; ctx.fill();
+        ctx.strokeStyle=circ.color+'44'; ctx.lineWidth=1;
+        ctx.setLineDash([4,4]); ctx.stroke(); ctx.setLineDash([]);
         ctx.restore();
       }
-      // Head
-      const sz = isHov ? 12 : 9;
+
+      const sz2=isHov?13:9;
       ctx.save();
-      ctx.beginPath(); ctx.arc(sp.x, sp.y, sz, 0, Math.PI*2);
-      ctx.fillStyle = '#0a1f0a'; ctx.fill();
-      ctx.strokeStyle = circ.color; ctx.lineWidth = 2.5; ctx.stroke();
-      ctx.beginPath(); ctx.arc(sp.x, sp.y, sz/2.5, 0, Math.PI*2);
-      ctx.fillStyle = circ.color; ctx.fill();
-      ctx.fillStyle = 'rgba(168,216,170,0.9)'; ctx.font = `bold ${isHov?10:9}px monospace`;
-      ctx.textAlign = 'center'; ctx.fillText(`S${i+1}`, sp.x, sp.y-(sz+5));
+      ctx.beginPath(); ctx.arc(sp.x,sp.y,sz2+2,0,Math.PI*2);
+      ctx.fillStyle='rgba(0,0,0,0.35)'; ctx.fill();
+      ctx.beginPath(); ctx.arc(sp.x,sp.y,sz2,0,Math.PI*2);
+      ctx.fillStyle='#0d2b0d'; ctx.fill();
+      ctx.strokeStyle=circ.color; ctx.lineWidth=2.5; ctx.stroke();
+      ctx.beginPath(); ctx.arc(sp.x,sp.y,sz2*0.35,0,Math.PI*2);
+      ctx.fillStyle=circ.color; ctx.fill();
+
+      ctx.fillStyle='rgba(200,240,160,0.9)'; ctx.font=`bold ${isHov?11:9}px monospace`; ctx.textAlign='center';
+      ctx.fillText('S'+(i+1),sp.x,sp.y-sz2-5);
+
+      if(isHov){
+        // #5 — show type on hover
+        ctx.fillStyle='rgba(168,216,170,0.8)'; ctx.font='8px monospace';
+        ctx.fillText(`${tLabel} · ${span}° · r=${sp.radius.toFixed(1)}m`,sp.x,sp.y+sz2+14);
+      }
       ctx.restore();
     });
   }
 
-  // ── Animation loop ───────────────────────────────────────────
-  useEffect(() => {
-    if (!animOn) {
-      if (animRef.current) cancelAnimationFrame(animRef.current);
-      wRef.current?.getContext('2d')?.clearRect(0,0,canvasSize.w,canvasSize.h);
+  // ── Animation ─────────────────────────────────────────────
+  useEffect(()=>{
+    if(!animOn){
+      if(animRef.current) cancelAnimationFrame(animRef.current);
+      wRef.current?.getContext('2d')?.clearRect(0,0,sz.w,sz.h);
       return;
     }
-    const cv  = cvRef.current!;
-    const wCv = wRef.current!;
-    const ctx = cv.getContext('2d')!;
-    const wCtx = wCv.getContext('2d')!;
-    animT0.current = null; lastSecT.current = null; totalSec.current = 0;
+    const cv=cvRef.current!,wCv=wRef.current!;
+    const ctx=cv.getContext('2d')!,wCtx=wCv.getContext('2d')!;
+    animT0.current=null;
 
-    function frame(ts: number) {
-      if (!animT0.current) animT0.current = ts;
-      ctx.clearRect(0, 0, canvasSize.w, canvasSize.h);
-      drawGrid(ctx, canvasSize.w, canvasSize.h);
-      if (polygon.length > 0) drawPoly(ctx);
-      drawPipesLayer(ctx);
-      drawSprinklersLayer(ctx);
+    function frame(ts:number){
+      if(!animT0.current) animT0.current=ts;
+      ctx.clearRect(0,0,sz.w,sz.h);
+      drawGrid(ctx); drawPoly(ctx);
+      if(activeTab==='pipes') drawPipesLayer(ctx);
+      drawHeads(ctx);
+      if(waterSrc) drawWaterSrc(ctx,waterSrc);
 
-      sprRef.current.forEach((sp) => {
-        if (!activeCircs.has(sp.circIdx)) return;
-        const circ = circRef.current[sp.circIdx];
-        if (!circ) return;
-        const span = ((sp.endA - sp.startA) + 360) % 360 || 360;
-        const period = (span<=100 ? 10000 : span<=200 ? 18000 : 25000) / speed;
-        const t = ((ts - animT0.current! + sp.phase * period) % period) / period;
-        let frac = t < 0.85
-          ? (t/0.85 < 0.08 ? 0.5*(t/0.85/0.08)**2*0.12 : t/0.85 > 0.9 ? 0.88+0.12*(1-(1-(t/0.85-0.9)/0.1)**2) : 0.06+(t/0.85-0.08)/0.82*0.82)
-          : Math.max(1-((t-0.85)/0.15)**3, 0);
-        frac = Math.min(Math.max(frac, 0), 1);
-        const r = sp.radius * m2px.current;
-        const a1r = sp.startA*Math.PI/180;
-        const a2r = (sp.startA + span*frac)*Math.PI/180;
-        const gr = ctx.createRadialGradient(sp.x,sp.y,0,sp.x,sp.y,r);
-        gr.addColorStop(0, circ.color+'cc'); gr.addColorStop(0.4, circ.color+'77');
-        gr.addColorStop(0.8, circ.color+'33'); gr.addColorStop(1, circ.color+'00');
-        ctx.save(); ctx.beginPath(); ctx.moveTo(sp.x,sp.y); ctx.arc(sp.x,sp.y,r,a1r,a2r);
-        ctx.closePath(); ctx.clip(); ctx.fillStyle=gr; ctx.fill(); ctx.restore();
-        // Needle
-        const na = (sp.startA + span*frac)*Math.PI/180;
-        ctx.save(); ctx.strokeStyle=circ.color; ctx.lineWidth=2; ctx.lineCap='round';
-        ctx.beginPath(); ctx.moveTo(sp.x,sp.y); ctx.lineTo(sp.x+11*Math.cos(na),sp.y+11*Math.sin(na));
-        ctx.stroke(); ctx.restore();
-        // Wet paint
-        if (frac > 0.04) {
+      sprRef.current.forEach(rawSp=>{
+        const circ=circRef.current[rawSp.circIdx]; if(!circ) return;
+        // Guard: recompute canvas coords if missing/NaN
+        let sp=rawSp;
+        if (!sp.x||!sp.y||!isFinite(sp.x)||!isFinite(sp.y)){
+          const c=toC(sp.xm,sp.ym); sp={...sp,x:c.x,y:c.y};
+        }
+        const span=((sp.endA-sp.startA)+360)%360||360;
+        const period=(span<=100?10000:span<=200?18000:25000)/speed;
+        const t=((ts-animT0.current!+sp.phase*period)%period)/period;
+        let frac=t<0.85
+          ?(t/0.85<0.08?0.5*(t/0.85/0.08)**2*0.12:t/0.85>0.9?0.88+0.12*(1-(1-(t/0.85-0.9)/0.1)**2):0.06+(t/0.85-0.08)/0.82*0.82)
+          :Math.max(1-((t-0.85)/0.15)**3,0);
+        frac=Math.min(Math.max(frac,0),1);
+        const r=Math.max(1,sp.radius*m2pxR.current);
+        const a1r=sp.startA*Math.PI/180, a2r=(sp.startA+span*frac)*Math.PI/180;
+        const gr=ctx.createRadialGradient(sp.x,sp.y,0,sp.x,sp.y,r);
+        gr.addColorStop(0,circ.color+'ee');
+        gr.addColorStop(0.5,circ.color+'88');
+        gr.addColorStop(1,circ.color+'00');
+        ctx.save(); ctx.beginPath(); ctx.moveTo(sp.x,sp.y);
+        ctx.arc(sp.x,sp.y,r,a1r,a2r); ctx.closePath();
+        ctx.clip(); ctx.fillStyle=gr; ctx.fill(); ctx.restore();
+        const na=(sp.startA+span*frac)*Math.PI/180;
+        ctx.save(); ctx.strokeStyle=circ.color; ctx.lineWidth=2.5; ctx.lineCap='round';
+        ctx.beginPath(); ctx.moveTo(sp.x,sp.y);
+        ctx.lineTo(sp.x+14*Math.cos(na),sp.y+14*Math.sin(na)); ctx.stroke(); ctx.restore();
+        if(frac>0.04){
+          // #2 — clip water animation to polygon
+          ctx.save();
+          ctx.beginPath();
+          polygon.forEach((p,i)=>i===0?wCtx.moveTo(p.x,p.y):wCtx.lineTo(p.x,p.y));
           wCtx.save(); wCtx.beginPath(); wCtx.moveTo(sp.x,sp.y);
           wCtx.arc(sp.x,sp.y,r*frac,a1r,a2r); wCtx.closePath();
           wCtx.fillStyle='rgba(10,60,8,0.012)'; wCtx.fill(); wCtx.restore();
+          ctx.restore();
+        }
+        if(frac>0.05&&frac<0.92&&Math.random()<0.35&&parts.current.length<300){
+          const pa=(sp.startA+span*frac*(0.2+Math.random()*0.8))*Math.PI/180;
+          const dist=(0.2+Math.random()*0.75)*r;
+          const perp=pa+Math.PI/2;
+          parts.current.push({x:sp.x+dist*Math.cos(pa),y:sp.y+dist*Math.sin(pa),
+            vx:Math.cos(perp)*0.7+Math.cos(pa)*0.2,vy:Math.sin(perp)*0.7+Math.sin(pa)*0.2,
+            life:0,maxL:15+Math.floor(Math.random()*20),r:0.7+Math.random()*1.5,color:circ.color});
         }
       });
 
-      // Timer update
-      if (!lastSecT.current) lastSecT.current = ts;
-      if (ts - lastSecT.current >= 1000/speed) {
-        totalSec.current++; lastSecT.current = ts;
+      for(let i=parts.current.length-1;i>=0;i--){
+        const p=parts.current[i]; p.life++;p.x+=p.vx;p.y+=p.vy;p.vy+=0.05;
+        if(p.life>=p.maxL){parts.current.splice(i,1);continue;}
+        ctx.save(); ctx.globalAlpha=(1-p.life/p.maxL)*0.7;
+        ctx.fillStyle=p.color; ctx.beginPath(); ctx.arc(p.x,p.y,p.r,0,Math.PI*2); ctx.fill(); ctx.restore();
       }
-
-      animRef.current = requestAnimationFrame(frame);
+      animRef.current=requestAnimationFrame(frame);
     }
-    animRef.current = requestAnimationFrame(frame);
-    return () => { if (animRef.current) cancelAnimationFrame(animRef.current); };
-  }, [animOn, activeCircs, speed, canvasSize, polygon, polyClosed]);
+    animRef.current=requestAnimationFrame(frame);
+    return ()=>{if(animRef.current)cancelAnimationFrame(animRef.current);};
+  },[animOn,speed,sz,polygon,polyClosed,activeTab,waterSrc]);
 
-  // ── Canvas events ────────────────────────────────────────────
-  function handleClick(e: React.MouseEvent<HTMLCanvasElement>) {
-    const x = e.nativeEvent.offsetX, y = e.nativeEvent.offsetY;
-    if (mode === 'draw') {
+  // ── Auto Place ────────────────────────────────────────────
+  function autoPlace() {
+    if (!polyClosed||polyM.length<3){setMsg('Desenează mai întâi curtea!');return;}
+
+    const raw=professionalPlace(polyM,curRadius,project.circuits.length);
+    if(!raw.length){setMsg('Nu s-au putut plasa aspersoare. Încearcă o rază mai mică.');return;}
+
+    const placed:PlacedSprinkler[]=raw.map(p=>{
+      const c=toC(p.xm,p.ym);
+      return{...p,x:c.x,y:c.y};
+    });
+
+    setSprinklers(placed);
+    recalcPipes(placed,waterSrc);
+    recalcCov(placed);
+
+    const {label}=sprinklerTypeLabel(curRadius);
+    const c90=placed.filter(s=>((s.endA-s.startA+360)%360||360)<=95).length;
+    const c180=placed.filter(s=>{const sp=((s.endA-s.startA+360)%360||360);return sp>95&&sp<=185;}).length;
+    const c360=placed.filter(s=>((s.endA-s.startA+360)%360||360)>185).length;
+    setMsg(`✅ ${placed.length} aspersoare ${label} · ${c90}×90° · ${c180}×180° · ${c360}×360°`);
+  }
+
+  // ── Canvas events ─────────────────────────────────────────
+  function getPos(e:React.MouseEvent<HTMLCanvasElement>){
+    return{x:e.nativeEvent.offsetX,y:e.nativeEvent.offsetY};
+  }
+
+  function handleClick(e:React.MouseEvent<HTMLCanvasElement>) {
+    const {x,y}=getPos(e);
+
+    // Water source placement mode (button click)
+    if (placingWS) {
+      const m=toM(x,y);
+      const ws={xm:m.x,ym:m.y,x,y};
+      setWaterSrc(ws);
+      setPlacingWS(false);
+      recalcPipes(sprinklers,ws);
+      setMsg('💧 Sursă apă plasată! Drag pentru a o muta. Traseele s-au recalculat.');
+      return;
+    }
+
+    // Alt+Click also works as before
+    if (e.altKey) {
+      const m=toM(x,y);
+      const ws={xm:m.x,ym:m.y,x,y};
+      setWaterSrc(ws);
+      recalcPipes(sprinklers,ws);
+      setMsg('💧 Sursă apă plasată! Traseele se recalculează automat.');
+      return;
+    }
+
+    if (mode==='draw') {
       if (polyClosed) return;
-      if (polygon.length > 2 && Math.hypot(x-polygon[0].x, y-polygon[0].y) < 15) {
+      if (polygon.length>2&&Math.hypot(x-polygon[0].x,y-polygon[0].y)<15) {
+        // Close polygon
+        const newPolyM=polygon.map(p=>toM(p.x,p.y));
         setPolyClosed(true);
-        const newPolyM = polygon.map(p => toMeters(p.x, p.y));
         setPolyM(newPolyM);
         setMode('add');
-        setMsg('Curtea a fost definită. Plasează aspersoare!');
+        setMsg('✅ Formă definită! Apasă ⚡ Automat.');
       } else {
-        setPolygon(prev => [...prev, {x, y}]);
+        setPolygon(prev=>[...prev,{x,y}]);
       }
-    } else if (mode === 'add') {
-      if (!polyClosed) { setMsg('Desenează mai întâi curtea!'); return; }
-      const m = toMeters(x, y);
-      if (!pip(m, polyM)) return;
-      const bb = bbox(polygon);
-      const r  = curRadius * m2px.current;
-      const mg = r * 0.45;
-      const L2 = x < bb.minX+mg, R2 = x > bb.maxX-mg, T2 = y < bb.minY+mg, B2 = y > bb.maxY-mg;
-      const sa = L2&&T2?0:R2&&T2?90:R2&&B2?180:L2&&B2?270:T2?0:B2?180:L2?270:R2?90:0;
-      const ea = L2&&T2?90:R2&&T2?180:R2&&B2?270:L2&&B2?360:T2?180:B2?360:L2?450:R2?270:360;
-      const newSp: PlacedSprinkler = {
-        id: sprinklers.length, x, y, xm: m.x, ym: m.y,
-        radius: curRadius, circIdx: selCirc, startA: sa, endA: ea, phase: Math.random(),
-      };
-      const updated = [...sprinklers, newSp];
-      setSprinklers(updated); calcPipes(updated);
-    } else if (mode === 'delete') {
-      const i = nearSp(x, y);
-      if (i !== null) { const u = sprinklers.filter((_,idx)=>idx!==i); setSprinklers(u); calcPipes(u); }
+    } else if (mode==='add') {
+      // #6 — Manual add
+      if(!polyClosed){setMsg('⚠️ Mai întâi desenează forma curții cu ✏️ Desenează formă!');return;}
+      const m=toM(x,y);
+      const currentPolyM=polyMRef.current;
+      if(!pip(m,currentPolyM)){setMsg('Click înăuntrul curții!');return;}
+      const bb=bbox(currentPolyM); const ez=curRadius*0.55;
+      const dL=m.x-bb.minX,dR=bb.maxX-m.x,dT=m.y-bb.minY,dB=bb.maxY-m.y;
+      const iL=dL<ez,iR=dR<ez,iT=dT<ez,iB=dB<ez;
+      let sa=0,ea=360;
+      if(iL&&iT){sa=0;ea=90;}else if(iR&&iT){sa=90;ea=180;}
+      else if(iR&&iB){sa=180;ea=270;}else if(iL&&iB){sa=270;ea=360;}
+      else if(iT){sa=0;ea=180;}else if(iB){sa=180;ea=360;}
+      else if(iL){sa=315;ea=405;}else if(iR){sa=135;ea=225;}
+      // #3 — auto-adjust radius if near edge
+      const dEdge=distToEdge(m.x,m.y,currentPolyM);
+      const r=Math.min(curRadius,dEdge*1.15);
+      const ns:PlacedSprinkler={id:sprinklers.length,x,y,xm:m.x,ym:m.y,
+        radius:r,circIdx:selCirc,startA:sa,endA:ea,phase:Math.random()};
+      const u=[...sprinklers,ns];
+      setSprinklers(u); recalcPipes(u,waterSrc); recalcCov(u);
+    } else if (mode==='delete') {
+      // #10 — delete only sprinklers, not the drawn area
+      const i=nearSp(x,y);
+      if(i!==null){const u=sprinklers.filter((_,idx)=>idx!==i);setSprinklers(u);recalcPipes(u,waterSrc);recalcCov(u);}
     }
   }
 
-  function handleDblClick(e: React.MouseEvent<HTMLCanvasElement>) {
-    const x = e.nativeEvent.offsetX, y = e.nativeEvent.offsetY;
-    if (mode==='draw' && !polyClosed && polygon.length > 2) {
-      setPolyClosed(true);
-      setPolyM(polygon.map(p => toMeters(p.x, p.y)));
-      setMode('add');
+  function handleDblClick(e:React.MouseEvent<HTMLCanvasElement>) {
+    if(mode==='draw'&&!polyClosed&&polygon.length>2){
+      const newPolyM=polygon.map(p=>toM(p.x,p.y));
+      setPolyClosed(true); setPolyM(newPolyM);
+      setMode('add'); setMsg('✅ Formă definită! Apasă ⚡ Automat.');
     }
   }
 
-  function handleMouseDown(e: React.MouseEvent<HTMLCanvasElement>) {
-    if (mode !== 'move') return;
-    const i = nearSp(e.nativeEvent.offsetX, e.nativeEvent.offsetY);
-    if (i !== null) setDragging({ i, ox: e.nativeEvent.offsetX - sprinklers[i].x, oy: e.nativeEvent.offsetY - sprinklers[i].y });
+  function handleMouseDown(e:React.MouseEvent<HTMLCanvasElement>) {
+    const {x,y}=getPos(e);
+    // #12 — drag water source
+    if(waterSrc&&Math.hypot(x-waterSrc.x,y-waterSrc.y)<16){setDraggingWS(true);return;}
+    // #7 — move SPRINKLER (not just radius)
+    if(mode==='move'){
+      const i=nearSp(x,y);
+      if(i!==null) setDraggingSp({i,ox:x-sprinklers[i].x,oy:y-sprinklers[i].y});
+    }
   }
 
-  function handleMouseMove(e: React.MouseEvent<HTMLCanvasElement>) {
-    const x = e.nativeEvent.offsetX, y = e.nativeEvent.offsetY;
-    if (dragging && mode==='move') {
-      const nx = x - dragging.ox, ny = y - dragging.oy;
-      const m  = toMeters(nx, ny);
-      setSprinklers(prev => {
-        const u = [...prev];
-        u[dragging.i] = { ...u[dragging.i], x: nx, y: ny, xm: m.x, ym: m.y };
+  function handleMouseMove(e:React.MouseEvent<HTMLCanvasElement>) {
+    const {x,y}=getPos(e);
+    if(mode==='draw'&&!polyClosed) setDrawPt({x,y});
+    else setDrawPt(null);
+
+    // #12 — drag water source
+    if(draggingWS&&waterSrc){
+      const m=toM(x,y);
+      const ws={xm:m.x,ym:m.y,x,y};
+      setWaterSrc(ws);
+      recalcPipes(sprinklers,ws);
+      return;
+    }
+    // #7 — drag sprinkler head
+    if(draggingSp&&mode==='move'){
+      const nx=x-draggingSp.ox, ny=y-draggingSp.oy;
+      const m=toM(nx,ny);
+      // #8 — auto adjust radius if moved near edge
+      const dEdge=pip(m,polyM)?distToEdge(m.x,m.y,polyM):0;
+      const r=dEdge>0?Math.min(sprinklers[draggingSp.i].radius,dEdge*1.15):sprinklers[draggingSp.i].radius;
+      setSprinklers(prev=>{
+        const u=[...prev];
+        u[draggingSp.i]={...u[draggingSp.i],x:nx,y:ny,xm:m.x,ym:m.y,radius:r};
         return u;
       });
       return;
     }
-    const i = nearSp(x, y);
-    if (i !== hovSp) setHovSp(i);
+    const i=nearSp(x,y); if(i!==hovSp) setHovSp(i);
   }
 
   function handleMouseUp() {
-    if (dragging) { calcPipes(sprinklers); setDragging(null); }
+    if(draggingWS){setDraggingWS(false);return;}
+    if(draggingSp){recalcPipes(sprinklers,waterSrc);recalcCov(sprinklers);setDraggingSp(null);}
   }
 
-  function nearSp(px: number, py: number, maxD = 18): number | null {
-    let best: number|null = null, bD = Infinity;
-    sprinklers.forEach((s, i) => {
-      const d = Math.hypot(px-s.x, py-s.y);
-      if (d < maxD && d < bD) { bD = d; best = i; }
-    });
+  function nearSp(px:number,py:number,maxD=18):number|null {
+    let best:number|null=null,bD=Infinity;
+    sprinklers.forEach((s,i)=>{const d=Math.hypot(px-s.x,py-s.y);if(d<maxD&&d<bD){bD=d;best=i;}});
     return best;
   }
 
-  // ── Auto place ───────────────────────────────────────────────
-  function autoPlace() {
-    if (!polyClosed || polygon.length < 3) { setMsg('Desenează mai întâi curtea!'); return; }
-    const r   = curRadius * m2px.current;
-    const bb  = bbox(polygon);
-    const step = r;
-    let id = 0;
-    const placed: PlacedSprinkler[] = [];
-    for (let y = bb.minY + r; y <= bb.maxY; y += step) {
-      for (let x = bb.minX + r; x <= bb.maxX; x += step) {
-        const m = toMeters(x, y);
-        if (!pip(m, polyM)) continue;
-        const mg = r*0.45;
-        const L2=x<bb.minX+mg,R2=x>bb.maxX-mg,T2=y<bb.minY+mg,B2=y>bb.maxY-mg;
-        const sa=L2&&T2?0:R2&&T2?90:R2&&B2?180:L2&&B2?270:T2?0:B2?180:L2?270:R2?90:0;
-        const ea=L2&&T2?90:R2&&T2?180:R2&&B2?270:L2&&B2?360:T2?180:B2?360:L2?450:R2?270:360;
-        placed.push({ id:id++, x, y, xm:m.x, ym:m.y, radius:curRadius, circIdx:id%project.circuits.length, startA:sa, endA:ea, phase:Math.random() });
-      }
-    }
-    setSprinklers(placed); calcPipes(placed);
-    setMsg(`✅ ${placed.length} aspersoare plasate automat`);
-  }
-
-  // ── Save ─────────────────────────────────────────────────────
+  // ── Save ──────────────────────────────────────────────────
   async function saveProject() {
     setSaving(true);
-    const sb = createClient();
-    const areaM2 = polyClosed && polyM.length > 2 ? polyArea(polyM) : null;
+    const sb=createClient();
+    const aM2=polyClosed&&polyM.length>2?polyAreaM(polyM):null;
     await sb.from('projects').update({
-      polygon:    polyM,
-      sprinklers: sprinklers.map(s => ({ ...s, x: undefined, y: undefined })), // save meters only
-      pipes:      pipes,
-      area_m2:    areaM2,
-    }).eq('id', project.id);
-    setSaving(false); setSaved(true);
-    setTimeout(() => setSaved(false), 2000);
+      polygon:polyM,
+      sprinklers:sprinklers.map(({x:_x,y:_y,...r})=>r),
+      pipes, area_m2:aM2,
+    }).eq('id',project.id);
+    setSaving(false); setSaved(true); setTimeout(()=>setSaved(false),2500);
   }
 
-  const pipeLen = pipes.reduce((s,p) => s+p.lengthM, 0);
-  const areaM2  = polyClosed && polyM.length > 2 ? polyArea(polyM) : 0;
+  // ── Materials list for report (#13) ───────────────────────
+  const materials = (() => {
+    const spMap:Record<string,number>={};
+    sprinklers.forEach(s=>{
+      const {label}=sprinklerTypeLabel(s.radius);
+      const key=`${label} r=${s.radius.toFixed(1)}m`;
+      spMap[key]=(spMap[key]||0)+1;
+    });
+    const pipeMain=pipes.filter(p=>p.type==='main').reduce((s,p)=>s+p.lengthM,0);
+    const pipeBranch=pipes.filter(p=>p.type!=='main').reduce((s,p)=>s+p.lengthM,0);
+    return {spMap,pipeMain,pipeBranch};
+  })();
+
+  const pipeLen=pipes.reduce((s,p)=>s+p.lengthM,0);
+  const areaM2=polyClosed&&polyM.length>2?polyAreaM(polyM):0;
+  const {label:spType,color:spColor}=sprinklerTypeLabel(curRadius);
 
   return (
     <div className="h-screen flex flex-col bg-green-950 overflow-hidden">
       {/* Header */}
-      <header className="flex items-center gap-3 px-4 py-2 border-b border-green-900 flex-shrink-0 flex-wrap">
-        <Link href="/dashboard" className="text-green-600 hover:text-green-300 text-sm flex items-center gap-1">
-          ← Dashboard
-        </Link>
+      <header className="flex items-center gap-3 px-4 py-2 border-b border-green-900 flex-shrink-0">
+        <Link href="/dashboard" className="text-green-600 hover:text-green-300 text-sm">← Dashboard</Link>
         <span className="text-green-800">|</span>
-        <span className="text-green-200 font-semibold text-sm truncate max-w-[180px]">{project.name}</span>
-        {project.location && <span className="text-green-700 text-xs hidden md:block">📍 {project.location}</span>}
-
-        {/* Tabs */}
+        <span className="text-green-200 font-semibold text-sm truncate max-w-[160px]">{project.name}</span>
         <div className="flex gap-1 ml-2">
-          {(['sim','pipes','report'] as const).map((t,i) => (
-            <button key={t} onClick={() => setActiveTab(t)}
+          {(['sim','pipes','report'] as const).map((t,i)=>(
+            <button key={t} onClick={()=>setActiveTab(t)}
               className={`text-xs px-3 py-1 rounded-md border transition-all
-                ${activeTab===t ? 'bg-green-800 border-green-600 text-green-200' : 'border-green-900 text-green-600 hover:border-green-700'}`}>
+                ${activeTab===t?'bg-green-800 border-green-600 text-green-200':'border-green-900 text-green-600 hover:border-green-700'}`}>
               {['🌊 Simulare','🔧 Trasee','📋 Raport'][i]}
             </button>
           ))}
         </div>
-
-        <div className="ml-auto flex items-center gap-2">
-          {isOwner && (
+        {sprinklers.length>0&&(
+          <div className={`px-2 py-0.5 rounded-full text-xs font-bold border
+            ${coverage>=95?'bg-green-900 border-green-600 text-green-300':
+              coverage>=80?'bg-yellow-900 border-yellow-600 text-yellow-300':
+                           'bg-red-900 border-red-700 text-red-300'}`}>
+            {coverage}% acoperire
+          </div>
+        )}
+        <div className="ml-auto flex gap-2">
+          {isOwner&&(
             <button onClick={saveProject} disabled={saving}
-              className={`text-xs px-4 py-1.5 rounded-lg border transition-all
-                ${saved ? 'bg-green-700 border-green-500 text-green-100' : 'btn-ghost'}`}>
-              {saving ? 'Se salvează...' : saved ? '✓ Salvat!' : '💾 Salvează'}
+              className={`text-xs px-3 py-1.5 rounded-lg border transition-all
+                ${saved?'bg-green-700 border-green-500 text-green-100':'border-green-800 text-green-500 hover:border-green-600 hover:text-green-300'}`}>
+              {saving?'...' :saved?'✓ Salvat':'💾 Salvează'}
             </button>
           )}
         </div>
       </header>
 
-      {/* Body */}
       <div className="flex flex-1 overflow-hidden">
         {/* Sidebar */}
-        <aside className="w-56 flex-shrink-0 border-r border-green-900 overflow-y-auto bg-green-950 p-3 flex flex-col gap-3">
+        <aside className="w-56 flex-shrink-0 border-r border-green-900 overflow-y-auto p-2.5 flex flex-col gap-2">
 
-          {/* Forma curte */}
+          {/* Formă */}
           <SbCard title="📐 Formă curte">
-            <SbBtn onClick={() => { setMode('draw'); setPolyClosed(false); setPolygon([]); setMsg('Click = punct · Dublu-click = închide'); }} active={mode==='draw'}>✏️ Redesenează</SbBtn>
-            <SbBtn onClick={() => { setPolyM(project.polygon); setPolyClosed(true); setMsg('Formă din proiect restaurată'); }}>↩ Reset formă</SbBtn>
+            <SbBtn onClick={()=>{
+              setMode('draw');setPolyClosed(false);setPolygon([]);setPolyM([]);
+              setMsg('Click = adaugă punct · Dublu-click sau click pe primul punct = închide');
+            }}>✏️ Desenează formă</SbBtn>
+            <div className="text-green-700 text-[10px] px-1">
+              Orice formă: dreptunghi, L, U, trapez, poligon liber (#4 · #11)
+            </div>
+            {polyClosed&&(
+              <SbBtn danger onClick={()=>{
+                setPolyClosed(false);setPolygon([]);setPolyM([]);
+                setSprinklers([]);setPipes([]);setCoverage(0);setWaterSrc(null);
+                computeScale(sz.w,sz.h,[]);
+                setMsg('Formă ștearsă. Desenează una nouă.');
+              }}>🗑 Șterge forma</SbBtn>
+            )}
           </SbCard>
 
           {/* Aspersor */}
           <SbCard title="💧 Aspersor">
-            <select value={selSp} onChange={e => { setSelSp(e.target.value); const [br,mo] = e.target.value.split('|'); const s = sprinklerDb.find(x=>x.brand===br&&x.model===mo); if(s) setCurRadius((s.rmin+s.rmax)/2||6); }}
-              className="w-full bg-green-950 border border-green-800 rounded-md px-2 py-1.5 text-xs text-green-200 mb-2">
-              <option value="">— selectează model —</option>
-              {Object.entries(
-                sprinklerDb.reduce((g,s) => { (g[s.brand]??=[]).push(s); return g; }, {} as Record<string,typeof sprinklerDb>)
-              ).map(([brand, items]) => (
-                <optgroup key={brand} label={brand}>
-                  {items.map(s => (
-                    <option key={s.id} value={`${s.brand}|${s.model}`}>
-                      {s.model} ({s.rmin}–{s.rmax}m)
-                    </option>
-                  ))}
-                </optgroup>
-              ))}
-            </select>
             <div className="flex items-center gap-2 text-xs">
-              <span className="text-green-600 w-16 flex-shrink-0">Raza (m)</span>
-              <input type="range" min={0.5} max={15} step={0.5} value={curRadius}
-                onChange={e => setCurRadius(+e.target.value)}
-                className="flex-1 h-1 bg-green-800 rounded appearance-none" />
-              <span className="text-green-300 font-mono w-8 text-right">{curRadius}m</span>
+              <span className="text-green-600 w-10">Raza</span>
+              <input type="range" min={1} max={15} step={0.5} value={curRadius}
+                onChange={e=>setCurRadius(+e.target.value)}
+                className="flex-1 h-1.5 bg-green-800 rounded appearance-none cursor-pointer"/>
+              <span className="text-green-300 font-mono font-bold w-10 text-right">{curRadius}m</span>
+            </div>
+            {/* #5 — Sprinkler type badge */}
+            <div className="flex items-center gap-2 mt-1 px-1">
+              <span className="text-[10px] px-2 py-0.5 rounded-full font-bold border"
+                style={{color:spColor,borderColor:spColor+'44',background:spColor+'11'}}>
+                {spType}
+              </span>
+              <span className="text-green-700 text-[10px]">Pas: {curRadius}m · Rând: {(curRadius*0.866).toFixed(1)}m</span>
+            </div>
+            <div className="flex gap-1 mt-1">
+              {[2,3,4,6,9,12].map(r=>(
+                <button key={r} onClick={()=>setCurRadius(r)}
+                  className={`flex-1 text-[10px] py-0.5 rounded border transition-all
+                    ${curRadius===r?'bg-green-700 border-green-500 text-white':'border-green-800 text-green-600 hover:border-green-600'}`}>
+                  {r}m
+                </button>
+              ))}
             </div>
           </SbCard>
 
           {/* Plasare */}
           <SbCard title="⚡ Plasare">
-            <SbBtn onClick={autoPlace}>⚡ Automat S→S</SbBtn>
-            <SbBtn onClick={() => setMode('add')} active={mode==='add'}>➕ Manual</SbBtn>
-            <SbBtn onClick={() => setMode('move')} active={mode==='move'}>✋ Mută</SbBtn>
-            <SbBtn onClick={() => setMode('delete')} active={mode==='delete'} danger>❌ Șterge</SbBtn>
+            <SbBtn highlight onClick={autoPlace}>⚡ Automat profesional</SbBtn>
+            <SbBtn active={mode==='add'} onClick={()=>{
+              setMode('add');
+              setMsg(polyClosed?'Click pe curte = adaugă aspersor manual':'Mai întâi desenează forma curții!');
+            }}>➕ Manual</SbBtn>
+            <SbBtn active={mode==='move'} onClick={()=>{setMode('move');setMsg('Drag pe un aspersor = mută');}}> ✋ Mută aspersor</SbBtn>
+            <SbBtn danger active={mode==='delete'} onClick={()=>{setMode('delete');setMsg('Click pe aspersor = șterge');}}>❌ Șterge aspersor</SbBtn>
+            <SbBtn danger onClick={()=>{setSprinklers([]);setPipes([]);setCoverage(0);setMsg('Toate aspersoarele șterse.');}}>🗑 Șterge toate</SbBtn>
           </SbCard>
 
-          {/* Trasee */}
-          <SbCard title="🔧 Trasee">
-            <div className="flex gap-1 mb-2">
-              {(['auto','manual'] as const).map(m => (
-                <button key={m} onClick={() => setPipeMode(m)}
-                  className={`flex-1 text-xs py-1 rounded border transition-all
-                    ${pipeMode===m ? 'bg-green-800 border-green-600 text-green-200' : 'border-green-900 text-green-600'}`}>
-                  {m==='auto' ? '⚡ Auto' : '✋ Manual'}
-                </button>
-              ))}
-            </div>
-            <SbBtn onClick={() => calcPipes(sprinklers)}>🔄 Recalculează</SbBtn>
-            <SbBtn onClick={() => setPipes([])} danger>🗑 Șterge trasee</SbBtn>
+          {/* Sursă apă */}
+          <SbCard title="💧 Sursă apă">
+            {!placingWS ? (
+              <SbBtn highlight={!waterSrc} active={false} onClick={()=>{
+                setPlacingWS(true);
+                setMode('add');
+                setMsg('💧 Click oriunde pe canvas pentru a plasa sursa de apă');
+              }}>💧 {waterSrc ? 'Mută sursa apă' : 'Plasează sursă apă'}</SbBtn>
+            ) : (
+              <div className="bg-blue-900/50 border border-blue-700 rounded-md px-2 py-1.5 text-xs text-blue-300 flex items-center gap-2">
+                <span className="animate-pulse">💧</span>
+                <span className="flex-1">Click pe canvas...</span>
+                <button onClick={()=>{setPlacingWS(false);setMsg('Plasare anulată');}} className="text-red-500 hover:text-red-300">✕</button>
+              </div>
+            )}
+            {waterSrc&&(
+              <div className="flex items-center gap-2 px-1">
+                <span className="text-blue-400 text-xs flex-1">📍 {waterSrc.xm.toFixed(1)}m, {waterSrc.ym.toFixed(1)}m</span>
+                <button onClick={()=>{setWaterSrc(null);setPlacingWS(false);recalcPipes(sprinklers,null);}}
+                  className="text-red-600 text-[10px] hover:text-red-400 border border-red-900 rounded px-1">Șterge</button>
+              </div>
+            )}
+            {!waterSrc&&!placingWS&&(
+              <div className="text-green-700 text-[10px] italic px-1">Neselectată — centroid folosit</div>
+            )}
+            <div className="text-green-800 text-[10px] px-1 mt-0.5">Drag 💧 = mută după plasare</div>
           </SbCard>
 
-          {/* Circuite */}
-          <SbCard title="⚡ Circuite">
-            {project.circuits.map((c, i) => (
-              <div key={c.id} onClick={() => setSelCirc(i)}
-                className={`flex items-center gap-2 px-2 py-1.5 rounded-lg cursor-pointer transition-all text-xs
-                  ${selCirc===i ? 'bg-green-800 border border-green-600' : 'hover:bg-green-900 border border-transparent'}`}>
-                <div className="w-3 h-3 rounded-full flex-shrink-0" style={{background:c.color,boxShadow:`0 0 5px ${c.color}`}} />
+          {/* Circuite (#9 — show unified) */}
+          <SbCard title="⚡ Circuite (#9)">
+            <div className="text-green-700 text-[10px] px-1 mb-1">Selectează circuitul pentru plasare manuală:</div>
+            {project.circuits.map((c,i)=>(
+              <div key={c.id} onClick={()=>setSelCirc(i)}
+                className={`flex items-center gap-2 px-2 py-1 rounded-lg cursor-pointer text-xs transition-all
+                  ${selCirc===i?'bg-green-800 border border-green-600':'hover:bg-green-900 border border-transparent'}`}>
+                <div className="w-2.5 h-2.5 rounded-full" style={{background:c.color,boxShadow:`0 0 4px ${c.color}`}}/>
                 <span className="flex-1 truncate text-green-200">{c.name}</span>
+                <span className="text-green-600 text-[10px]">{sprinklers.filter(s=>s.circIdx===i).length}×</span>
               </div>
             ))}
           </SbCard>
 
-          {/* Animație */}
-          <SbCard title="▶ Simulare">
+          {/* Animatie */}
+          <SbCard title="▶ Animație">
             {!animOn
-              ? <SbBtn onClick={() => { setAnimOn(true); setActiveCircs(new Set(project.circuits.map((_,i)=>i))); }}>▶ Toate</SbBtn>
-              : <SbBtn onClick={() => setAnimOn(false)} danger>⏹ Stop</SbBtn>
+              ?<SbBtn highlight onClick={()=>setAnimOn(true)}>▶ Pornește</SbBtn>
+              :<SbBtn danger onClick={()=>{setAnimOn(false);parts.current=[];wRef.current?.getContext('2d')?.clearRect(0,0,sz.w,sz.h);}}>⏹ Stop</SbBtn>
             }
-            {project.circuits.map((c,i) => (
-              <SbBtn key={c.id} onClick={() => { setAnimOn(true); setActiveCircs(new Set([i])); }}
-                style={{borderLeft:`3px solid ${c.color}`}}>
-                ▶ {c.name}
-              </SbBtn>
-            ))}
             <div className="flex items-center gap-2 text-xs mt-1">
-              <span className="text-green-600 w-14">Viteză</span>
+              <span className="text-green-600 w-12">Viteză</span>
               <input type="range" min={0.3} max={4} step={0.1} value={speed}
                 onChange={e=>setSpeed(+e.target.value)}
-                className="flex-1 h-1 bg-green-800 rounded appearance-none" />
+                className="flex-1 h-1 bg-green-800 rounded appearance-none cursor-pointer"/>
               <span className="text-green-300 font-mono w-8 text-right">{speed.toFixed(1)}×</span>
             </div>
           </SbCard>
 
-          {/* Info */}
-          <SbCard title="ℹ Info">
+          {/* Stats */}
+          <SbCard title="📊 Statistici">
             {[
-              ['Suprafață', areaM2>0 ? areaM2.toFixed(1)+' m²' : '—'],
+              ['Suprafață', areaM2>0?areaM2.toFixed(0)+' m²':'—'],
               ['Aspersoare', sprinklers.length],
-              ['Țeavă', pipeLen>0 ? pipeLen.toFixed(1)+'m' : '—'],
-              ['Circuite', project.circuits.length],
-            ].map(([l,v]) => (
-              <div key={String(l)} className="flex justify-between text-xs py-0.5 border-b border-green-900">
+              ['Tip', sprinklers.length>0?spType:'—'],
+              ['Colțuri 90°', sprinklers.filter(s=>((s.endA-s.startA+360)%360||360)<=95).length],
+              ['Margini 180°', sprinklers.filter(s=>{const sp=((s.endA-s.startA+360)%360||360);return sp>95&&sp<=185;}).length],
+              ['Interior 360°', sprinklers.filter(s=>((s.endA-s.startA+360)%360||360)>185).length],
+              ['Țeavă total', pipeLen>0?pipeLen.toFixed(1)+'m':'—'],
+              ['Acoperire', sprinklers.length>0?coverage+'%':'—'],
+            ].map(([l,v])=>(
+              <div key={String(l)} className="flex justify-between text-xs py-0.5 border-b border-green-900 last:border-0">
                 <span className="text-green-600">{l}</span>
-                <span className="text-green-300 font-mono">{v}</span>
+                <span className={`font-mono font-bold ${String(l)==='Acoperire'?coverage>=95?'text-green-300':coverage>=80?'text-yellow-300':'text-red-400':'text-green-300'}`}>{v}</span>
               </div>
             ))}
           </SbCard>
 
         </aside>
 
-        {/* Canvas area */}
+        {/* Canvas / Report */}
         <div className="flex-1 relative overflow-hidden">
-          <canvas ref={wRef}
-            width={canvasSize.w} height={canvasSize.h}
-            className="absolute inset-0 pointer-events-none" />
-          <canvas ref={cvRef}
-            width={canvasSize.w} height={canvasSize.h}
-            className="absolute inset-0"
-            style={{ cursor: mode==='move' ? (dragging ? 'grabbing' : 'grab') : mode==='delete' ? 'not-allowed' : mode==='draw' ? 'crosshair' : 'cell' }}
-            onClick={handleClick}
-            onDoubleClick={handleDblClick}
-            onMouseDown={handleMouseDown}
-            onMouseMove={handleMouseMove}
-            onMouseUp={handleMouseUp}
-            onMouseLeave={() => { handleMouseUp(); setHovSp(null); }}
-          />
-          {/* Mode label */}
-          <div className="absolute top-3 left-1/2 -translate-x-1/2 bg-green-950/85 border border-green-800 rounded-full px-4 py-1 text-xs text-green-500 pointer-events-none backdrop-blur-sm">
-            {msg}
-          </div>
-          {/* Pipe legend for pipes tab */}
-          {activeTab==='pipes' && (
-            <div className="absolute bottom-3 right-3 bg-green-950/90 border border-green-800 rounded-lg p-3 text-xs space-y-1.5 backdrop-blur-sm">
-              <div className="flex items-center gap-2"><div className="w-5 h-0.5 bg-yellow-400"/><span className="text-green-400">Conductă principală PE32</span></div>
-              <div className="flex items-center gap-2"><div className="w-5 h-0.5 bg-orange-500"/><span className="text-green-400">Circuit aspersor PE25</span></div>
-              <div className="flex items-center gap-2"><div className="w-5 h-0.5 bg-cyan-400"/><span className="text-green-400">Picurare PE16</span></div>
-            </div>
+          {activeTab==='report' ? (
+            <ReportTab
+              project={project}
+              sprinklers={sprinklers}
+              pipes={pipes}
+              areaM2={areaM2}
+              coverage={coverage}
+              materials={materials}
+              spType={spType}
+              curRadius={curRadius}
+              waterSrc={waterSrc}
+            />
+          ) : (
+            <>
+              <canvas ref={wRef} width={sz.w} height={sz.h} className="absolute inset-0 pointer-events-none"/>
+              <canvas ref={cvRef} width={sz.w} height={sz.h} className="absolute inset-0"
+                style={{cursor:
+                  placingWS?'crosshair':
+                  draggingWS?'grabbing':
+                  mode==='move'?(draggingSp?'grabbing':'grab'):
+                  mode==='delete'?'not-allowed':
+                  mode==='draw'?'crosshair':'cell'}}
+                onClick={handleClick} onDoubleClick={handleDblClick}
+                onMouseDown={handleMouseDown} onMouseMove={handleMouseMove}
+                onMouseUp={handleMouseUp} onMouseLeave={()=>{handleMouseUp();setHovSp(null);setDrawPt(null);}}/>
+              <div className="absolute top-3 left-1/2 -translate-x-1/2 bg-green-950/85 border border-green-800 rounded-full px-5 py-1.5 text-xs text-green-500 pointer-events-none backdrop-blur-sm max-w-[85%] text-center">
+                {msg}
+              </div>
+              {activeTab==='pipes'&&(
+                <div className="absolute bottom-4 right-4 bg-green-950/92 border border-green-800 rounded-lg p-3 text-xs space-y-1.5 backdrop-blur-sm min-w-[180px]">
+                  <div className="text-green-500 font-bold uppercase text-[10px] tracking-wider mb-2">Legendă trasee</div>
+                  <div className="flex items-center gap-2">
+                    <div className="w-8 h-2 bg-yellow-400 rounded" style={{boxShadow:'0 0 4px #f0c040'}}/>
+                    <span className="text-green-300">Conductă principală</span>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    {project.circuits.map((c,i)=>(
+                      <div key={i} className="w-2 h-2 rounded-full flex-shrink-0" style={{background:c.color}}/>
+                    ))}
+                    <span className="text-green-300">Circuite laterale</span>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <div className="w-5 h-5 rounded-full bg-blue-700 border-2 border-blue-300 flex items-center justify-center">
+                      <span className="text-white text-[8px] font-bold">SA</span>
+                    </div>
+                    <span className="text-green-300">Sursă apă</span>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <div className="w-5 h-5 rounded-full bg-green-900 border-2 border-green-400 flex items-center justify-center">
+                      <span className="text-green-300 text-[8px] font-bold">V</span>
+                    </div>
+                    <span className="text-green-300">Valvă circuit</span>
+                  </div>
+                  <div className="border-t border-green-800 pt-1.5 mt-1">
+                    <div className="text-green-600 text-[9px]">Total conductă: <span className="text-green-300 font-mono">{pipes.reduce((s,p)=>s+p.lengthM,0).toFixed(1)}m</span></div>
+                    <div className="text-green-600 text-[9px]">Principală: <span className="text-yellow-300 font-mono">{pipes.filter(p=>p.type==='main').reduce((s,p)=>s+p.lengthM,0).toFixed(1)}m</span></div>
+                    <div className="text-green-600 text-[9px]">Laterale: <span className="text-green-300 font-mono">{pipes.filter(p=>p.type==='branch').reduce((s,p)=>s+p.lengthM,0).toFixed(1)}m</span></div>
+                  </div>
+                </div>
+              )}
+            </>
           )}
         </div>
       </div>
 
-      {/* Dashboard bar */}
-      <div className="border-t border-green-900 px-4 py-2 flex items-center gap-6 text-xs bg-green-950 flex-shrink-0">
-        {[
-          ['Aspersoare', sprinklers.length, ''],
-          ['Suprafață', areaM2>0?areaM2.toFixed(0):'—', 'm²'],
-          ['Țeavă', pipeLen>0?pipeLen.toFixed(1):'—', 'm'],
-          ['Circuit activ', selCirc>=0?project.circuits[selCirc]?.name:'—', ''],
-        ].map(([l,v,u]) => (
-          <div key={String(l)}>
-            <span className="text-green-700">{l}: </span>
-            <span className="text-green-300 font-mono font-bold">{v}{u}</span>
-          </div>
-        ))}
-        {animOn && (
-          <span className="ml-auto flex items-center gap-1.5 text-green-400">
-            <span className="w-1.5 h-1.5 bg-green-400 rounded-full animate-pulse" /> Simulare activă
+      {/* Status bar */}
+      <div className="border-t border-green-900 px-5 py-1.5 flex items-center gap-5 text-xs bg-green-950 flex-shrink-0">
+        <span><span className="text-green-700">Suprafață: </span><span className="text-green-300 font-mono">{areaM2>0?areaM2.toFixed(0)+' m²':'—'}</span></span>
+        <span><span className="text-green-700">Aspersoare: </span><span className="text-green-300 font-mono">{sprinklers.length}</span></span>
+        <span><span className="text-green-700">Țeavă: </span><span className="text-green-300 font-mono">{pipeLen>0?pipeLen.toFixed(1)+'m':'—'}</span></span>
+        <span><span className="text-green-700">Acoperire: </span>
+          <span className={`font-mono font-bold ${coverage>=95?'text-green-300':coverage>=80?'text-yellow-300':'text-red-400'}`}>
+            {sprinklers.length>0?coverage+'%':'—'}
           </span>
-        )}
+        </span>
+        <span className="text-green-700 text-[10px]">Alt+Click = sursă apă</span>
+        {animOn&&<span className="ml-auto text-green-400 flex items-center gap-1"><span className="w-1.5 h-1.5 bg-green-400 rounded-full animate-pulse"/>Simulare activă</span>}
       </div>
     </div>
   );
 }
 
-// ── Small UI helpers ─────────────────────────────────────────
-function SbCard({ title, children }: { title: string; children: React.ReactNode }) {
+// ════════════════════════════════════════════════════════════
+// REPORT TAB (#13)
+// ════════════════════════════════════════════════════════════
+function ReportTab({project,sprinklers,pipes,areaM2,coverage,materials,spType,curRadius,waterSrc}:{
+  project:DbProject; sprinklers:PlacedSprinkler[]; pipes:Pipe[];
+  areaM2:number; coverage:number; materials:any; spType:string; curRadius:number;
+  waterSrc:WaterSource|null;
+}) {
+  const totalPipe=pipes.reduce((s,p)=>s+p.lengthM,0);
+
+  // Estimate costs (RON, approximate)
+  const costPerSp=spType==='Spray fix'?45:spType==='Spray rot.'?75:spType==='Jet rotor'?120:150;
+  const costPipe=Math.ceil(totalPipe*1.15)*8; // +15% pierderi, 8 RON/m
+  const costValves=project.circuits.length*180;
+  const costController=350;
+  const costInstall=Math.ceil(areaM2*12); // 12 RON/m²
+  const costTotal=sprinklers.length*costPerSp+costPipe+costValves+costController+costInstall;
+
+  function printReport() { window.print(); }
+
   return (
-    <div className="bg-green-900/60 border border-green-800 rounded-lg p-2.5">
+    <div className="h-full overflow-y-auto p-6 text-green-200" id="print-report">
+      <div className="max-w-2xl mx-auto space-y-6">
+
+        <div className="flex items-center justify-between">
+          <h1 className="text-xl font-bold text-green-300">📋 Raport Proiect — {project.name}</h1>
+          <button onClick={printReport}
+            className="text-xs px-4 py-2 bg-green-800 border border-green-600 rounded-lg hover:bg-green-700 text-green-200 transition-all">
+            🖨 Printează / PDF
+          </button>
+        </div>
+
+        {/* Summary */}
+        <Section title="Rezumat proiect">
+          <Row l="Locație" v={project.location||'—'}/>
+          <Row l="Suprafață totală" v={areaM2>0?areaM2.toFixed(0)+' m²':'—'}/>
+          <Row l="Acoperire" v={coverage+'%'} highlight={coverage>=95?'green':coverage>=80?'yellow':'red'}/>
+          <Row l="Sursa apă" v={waterSrc?`${waterSrc.xm.toFixed(1)}m, ${waterSrc.ym.toFixed(1)}m`:'Centrul curții'}/>
+          <Row l="Circuite" v={project.circuits.length+' zone'}/>
+        </Section>
+
+        {/* Sprinklers */}
+        <Section title="Aspersoare">
+          <Row l="Tip" v={spType}/>
+          <Row l="Raza de acoperire" v={curRadius+'m'}/>
+          <Row l="Total aspersoare" v={sprinklers.length+'×'}/>
+          {Object.entries(materials.spMap).map(([k,v])=>(
+            <Row key={k} l={'  '+k} v={v+'×'}/>
+          ))}
+          <Row l="Colțuri (90°)" v={sprinklers.filter(s=>((s.endA-s.startA+360)%360||360)<=95).length+'×'}/>
+          <Row l="Margini (180°)" v={sprinklers.filter(s=>{const sp=((s.endA-s.startA+360)%360||360);return sp>95&&sp<=185;}).length+'×'}/>
+          <Row l="Interior (360°)" v={sprinklers.filter(s=>((s.endA-s.startA+360)%360||360)>185).length+'×'}/>
+        </Section>
+
+        {/* Pipes */}
+        <Section title="Conducte">
+          <Row l="Conductă principală" v={materials.pipeMain.toFixed(1)+'m'}/>
+          <Row l="Circuite laterale" v={materials.pipeBranch.toFixed(1)+'m'}/>
+          <Row l="Total conductă" v={(totalPipe*1.15).toFixed(1)+'m (incl. 15% pierderi)'}/>
+          <Row l="Tip recomandat" v="PVC PN6 ø25mm principal / ø20mm lateral"/>
+        </Section>
+
+        {/* Lista materiale (#13) */}
+        <Section title="📦 Listă materiale estimativă">
+          <div className="text-green-700 text-[10px] mb-2">* Cantități orientative. Verificați cu furnizorul.</div>
+          <Row l={`Aspersoare ${spType}`} v={sprinklers.length+'× buc'}/>
+          <Row l="Conductă principală PVC ø25" v={Math.ceil(materials.pipeMain*1.15)+'m'}/>
+          <Row l="Conductă laterală PVC ø20" v={Math.ceil(materials.pipeBranch*1.15)+'m'}/>
+          <Row l="Electrovalve" v={project.circuits.length+'× buc'}/>
+          <Row l="Controler programare" v="1× buc"/>
+          <Row l="Capete T/L fitinguri" v={Math.ceil(sprinklers.length*1.5)+'× buc (est.)'}/>
+          <Row l="Coliere / fixare" v={Math.ceil(totalPipe/2)+'× buc (est.)'}/>
+          <Row l="Filtru/Reductor presiune" v="1× buc"/>
+        </Section>
+
+        {/* Cost estimate (#13) */}
+        <Section title="💰 Estimare cost (RON)">
+          <div className="text-green-700 text-[10px] mb-2">* Estimare orientativă. Prețuri pot varia.</div>
+          <Row l={`Aspersoare (${sprinklers.length}× × ${costPerSp} RON)`} v={sprinklers.length*costPerSp+' RON'}/>
+          <Row l="Conducte + fitinguri" v={costPipe+' RON'}/>
+          <Row l="Electrovalve (zone)" v={costValves+' RON'}/>
+          <Row l="Controler programare" v={costController+' RON'}/>
+          <Row l="Manoperă instalare" v={costInstall+' RON'}/>
+          <div className="border-t border-green-700 mt-2 pt-2 flex justify-between">
+            <span className="text-green-300 font-bold">TOTAL ESTIMAT</span>
+            <span className="text-green-300 font-bold font-mono">{costTotal.toLocaleString()} RON</span>
+          </div>
+        </Section>
+
+        {/* Best practices note */}
+        <Section title="✅ Best Practices aplicate">
+          <div className="text-green-600 text-xs space-y-1 leading-relaxed">
+            <p>• Head-to-head coverage (Rain Bird/Hunter standard) — fiecare aspersor acoperă până la cel vecin</p>
+            <p>• Triangular grid spacing — eficiență maximă cu număr minim de aspersoare</p>
+            <p>• Colțuri 90°, margini 180°, interior 360° — distribuție uniformă</p>
+            <p>• Raza auto-ajustată la marginea poligonului — fără risipă în afara curții</p>
+            <p>• MST (Minimum Spanning Tree) pentru rutare conducte — lungime minimă</p>
+            <p>• Separare circuite/zone — presiune optimă per circuit</p>
+            <p>• Sursă apă configurabilă — optimizare rută principală</p>
+          </div>
+        </Section>
+
+        <div className="text-center text-green-800 text-xs pt-4 border-t border-green-900">
+          Generat de IrigaPRO · {new Date().toLocaleDateString('ro-RO')}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function Section({title,children}:{title:string;children:React.ReactNode}){
+  return(
+    <div className="bg-green-900/40 border border-green-800 rounded-lg p-4">
+      <div className="text-green-500 font-bold text-sm mb-3 border-b border-green-800 pb-2">{title}</div>
+      <div className="space-y-1">{children}</div>
+    </div>
+  );
+}
+
+function Row({l,v,highlight}:{l:string;v:any;highlight?:'green'|'yellow'|'red'}){
+  const vc=highlight==='green'?'text-green-300':highlight==='yellow'?'text-yellow-300':highlight==='red'?'text-red-400':'text-green-300';
+  return(
+    <div className="flex justify-between text-xs py-0.5">
+      <span className="text-green-600">{l}</span>
+      <span className={`font-mono font-bold ${vc}`}>{v}</span>
+    </div>
+  );
+}
+
+// ════════════════════════════════════════════════════════════
+// UI HELPERS
+// ════════════════════════════════════════════════════════════
+function SbCard({title,children}:{title:string;children:React.ReactNode}){
+  return(
+    <div className="bg-green-900/50 border border-green-800 rounded-lg p-2.5">
       <div className="text-green-700 text-[10px] font-bold uppercase tracking-widest mb-2">{title}</div>
       <div className="flex flex-col gap-1">{children}</div>
     </div>
   );
 }
 
-function SbBtn({ onClick, children, active, danger, style }: {
-  onClick: () => void; children: React.ReactNode;
-  active?: boolean; danger?: boolean; style?: React.CSSProperties;
-}) {
-  return (
+function SbBtn({onClick,children,active,danger,highlight,style}:{
+  onClick:()=>void;children:React.ReactNode;
+  active?:boolean;danger?:boolean;highlight?:boolean;style?:React.CSSProperties;
+}){
+  return(
     <button onClick={onClick} style={style}
-      className={`w-full text-left px-2.5 py-1.5 rounded-md border text-xs transition-all
-        ${active  ? 'bg-green-700 border-green-500 text-green-100' :
-          danger  ? 'border-red-900 text-red-500 hover:bg-red-950 hover:border-red-700' :
-                    'border-green-800 text-green-400 hover:bg-green-800 hover:text-green-200'}`}>
+      className={`w-full text-left px-2.5 py-1.5 rounded-md border text-xs font-medium transition-all
+        ${highlight?'bg-green-700 border-green-500 text-green-100 hover:bg-green-600':
+          active  ?'bg-green-800 border-green-600 text-green-100':
+          danger  ?'border-red-900 text-red-500 hover:bg-red-950 hover:border-red-700':
+                   'border-green-800 text-green-500 hover:bg-green-800 hover:text-green-200'}`}>
       {children}
     </button>
   );

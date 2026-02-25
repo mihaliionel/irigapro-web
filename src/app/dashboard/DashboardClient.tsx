@@ -14,10 +14,8 @@ export default function DashboardClient({ user, projects }: Props) {
   const [creating, setCreating] = useState(false);
   const [deleting, setDeleting] = useState<string | null>(null);
   const [showNew, setShowNew]   = useState(false);
-  const [newName, setNewName]   = useState('Proiect nou');
+  const [newName, setNewName]   = useState('');
   const [newLoc,  setNewLoc]    = useState('');
-  const [newL,    setNewL]      = useState(18);
-  const [newW,    setNewW]      = useState(10);
 
   async function handleLogout() {
     const sb = createClient();
@@ -26,20 +24,17 @@ export default function DashboardClient({ user, projects }: Props) {
   }
 
   async function createProject() {
+    if (!newName.trim()) return;
     setCreating(true);
     const sb = createClient();
-    const { data, error } = await sb.from('projects').insert({
+    const { data } = await sb.from('projects').insert({
       user_id:  user.id,
-      name:     newName,
-      location: newLoc,
-      length_m: newL,
-      width_m:  newW,
-      polygon:  [
-        {x:0,   y:0},
-        {x:newL,y:0},
-        {x:newL,y:newW},
-        {x:0,   y:newW},
-      ],
+      name:     newName.trim(),
+      location: newLoc.trim(),
+      // No pre-set dimensions — user draws any shape in the simulator
+      length_m: 0,
+      width_m:  0,
+      polygon:  [],
       circuits: [
         {id:'c1',name:'Circuit 1',color:'#4CAF50',sprinkler:'Rain Bird 3504',radius:6,pressure:2.5,flow:0.9},
         {id:'c2',name:'Circuit 2',color:'#2196F3',sprinkler:'Rain Bird 3504',radius:6,pressure:2.5,flow:0.9},
@@ -105,41 +100,52 @@ export default function DashboardClient({ user, projects }: Props) {
 
         {/* New project modal */}
         {showNew && (
-          <div className="fixed inset-0 bg-black/60 backdrop-blur-sm z-50 flex items-center justify-center p-4">
-            <div className="card w-full max-w-md animate-slide-up">
-              <h2 className="font-bold text-green-100 text-lg mb-4">Proiect nou</h2>
+          <div className="fixed inset-0 bg-black/60 backdrop-blur-sm z-50 flex items-center justify-center p-4"
+            onClick={e => { if(e.target===e.currentTarget) setShowNew(false); }}>
+            <div className="card w-full max-w-md">
+              {/* Header */}
+              <div className="flex items-center justify-between mb-5">
+                <div>
+                  <h2 className="font-bold text-green-100 text-lg">Proiect nou</h2>
+                  <p className="text-green-600 text-xs mt-0.5">Forma curții se desenează direct în simulator</p>
+                </div>
+                <button onClick={() => setShowNew(false)} className="text-green-700 hover:text-green-400 text-xl leading-none">×</button>
+              </div>
+
               <div className="flex flex-col gap-3">
                 <div>
-                  <label className="label">Nume proiect</label>
-                  <input className="input" value={newName}
-                    onChange={e => setNewName(e.target.value)} placeholder="Curte casa Ionescu" />
+                  <label className="label">Nume proiect <span className="text-red-500">*</span></label>
+                  <input className="input" value={newName} autoFocus
+                    onChange={e => setNewName(e.target.value)}
+                    onKeyDown={e => e.key==='Enter' && newName.trim() && createProject()}
+                    placeholder="ex: Curte casă Ionescu" />
                 </div>
                 <div>
-                  <label className="label">Locație (opțional)</label>
+                  <label className="label">Locație <span className="text-green-700">(opțional)</span></label>
                   <input className="input" value={newLoc}
-                    onChange={e => setNewLoc(e.target.value)} placeholder="Timișoara, str. Florilor 12" />
+                    onChange={e => setNewLoc(e.target.value)}
+                    placeholder="ex: Timișoara, str. Florilor 12" />
                 </div>
-                <div className="grid grid-cols-2 gap-3">
-                  <div>
-                    <label className="label">Lungime (m)</label>
-                    <input type="number" className="input" value={newL} min={1} max={500}
-                      onChange={e => setNewL(+e.target.value)} />
-                  </div>
-                  <div>
-                    <label className="label">Lățime (m)</label>
-                    <input type="number" className="input" value={newW} min={1} max={500}
-                      onChange={e => setNewW(+e.target.value)} />
+
+                {/* Info banner */}
+                <div className="bg-green-950/60 border border-green-800 rounded-lg p-3 flex gap-3 items-start">
+                  <span className="text-2xl mt-0.5">✏️</span>
+                  <div className="text-xs text-green-400 space-y-1">
+                    <div className="font-semibold text-green-300">Formă liberă în simulator</div>
+                    <div>Click punct cu punct pentru <strong>orice formă</strong> de curte:</div>
+                    <div className="flex flex-wrap gap-1 mt-1">
+                      {['Dreptunghi','Formă L','Formă U','Trapez','Poligon liber','Curte cu intrânduri'].map(s=>(
+                        <span key={s} className="bg-green-900/60 border border-green-700 rounded px-1.5 py-0.5 text-green-300">{s}</span>
+                      ))}
+                    </div>
                   </div>
                 </div>
-                <p className="text-green-700 text-xs">
-                  Suprafață estimată: <strong className="text-green-500">{(newL * newW).toFixed(0)} m²</strong>.
-                  Poți remodela curtea în simulator.
-                </p>
               </div>
+
               <div className="flex gap-2 mt-5">
                 <button onClick={() => setShowNew(false)} className="btn-ghost flex-1">Anulează</button>
-                <button onClick={createProject} disabled={creating} className="btn-primary flex-1">
-                  {creating ? 'Se creează...' : 'Creează și deschide'}
+                <button onClick={createProject} disabled={creating || !newName.trim()} className="btn-primary flex-1">
+                  {creating ? '⏳ Se creează...' : '🚀 Creează proiect'}
                 </button>
               </div>
             </div>
@@ -198,7 +204,7 @@ function ProjectCard({ project: p, onDelete, deleting }:
       {/* Stats */}
       <div className="grid grid-cols-3 gap-2">
         {[
-          { lbl: 'Suprafață', val: p.area_m2 ? `${p.area_m2.toFixed(0)} m²` : `${(p.length_m * p.width_m).toFixed(0)} m²` },
+          { lbl: 'Suprafață', val: p.area_m2 ? `${p.area_m2.toFixed(0)} m²` : (p.length_m && p.width_m ? `~${(p.length_m * p.width_m).toFixed(0)} m²` : '—') },
           { lbl: 'Aspersoare', val: spCount },
           { lbl: 'Circuite', val: circCount },
         ].map(s => (

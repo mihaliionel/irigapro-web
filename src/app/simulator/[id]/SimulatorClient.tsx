@@ -62,209 +62,193 @@ function distToEdge(xm:number,ym:number, polyM:{x:number,y:number}[]): number {
 }
 
 // ════════════════════════════════════════════════════════════
-// PIPE ROUTING — Professional perimeter-following system
+// PIPE ROUTING — Best-practice minimal-trench system
 //
-// Inspired by real irrigation designs:
-//   • SA placed on polygon perimeter (or nearest edge point)
-//   • Main pipe follows polygon perimeter to each zone valve
-//   • Lateral pipes branch perpendicular from main to each head
-//   • Flow rate = Σ(head flow) displayed on each segment
+// PRINCIPLES (minimize excavation):
+//   1. ONE main trunk: SA → runs along ONE perimeter edge to a manifold point
+//   2. Per circuit: ONE branch from manifold along perimeter to circuit area
+//   3. Laterals: spine line through sprinkler row cluster + drops to each head
+//      (like a "comb" pattern — 1 trench per row, not star topology)
+//
+// This mirrors how real installers work: dig one main trench, then
+// small lateral trenches per row of sprinklers.
 // ════════════════════════════════════════════════════════════
 
-// Project a point onto the nearest point on a polygon edge
 function nearestPerimeterPoint(
   xm:number, ym:number,
   polyM:{x:number,y:number}[]
-): {x:number,y:number,edgeIdx:number,t:number,dist:number} {
-  let best = {x:xm,y:ym,edgeIdx:0,t:0,dist:Infinity};
-  for (let i=0;i<polyM.length;i++){
-    const p1=polyM[i], p2=polyM[(i+1)%polyM.length];
-    const dx=p2.x-p1.x, dy=p2.y-p1.y, len2=dx*dx+dy*dy;
-    if (len2<0.0001) continue;
-    const t=Math.max(0,Math.min(1,((xm-p1.x)*dx+(ym-p1.y)*dy)/len2));
-    const px=p1.x+t*dx, py=p1.y+t*dy;
-    const d=Math.hypot(xm-px,ym-py);
-    if (d<best.dist) best={x:px,y:py,edgeIdx:i,t,dist:d};
+):{x:number,y:number,edgeIdx:number,t:number,dist:number} {
+  let best={x:xm,y:ym,edgeIdx:0,t:0,dist:Infinity};
+  for(let i=0;i<polyM.length;i++){
+    const p1=polyM[i],p2=polyM[(i+1)%polyM.length];
+    const dx=p2.x-p1.x,dy=p2.y-p1.y,l2=dx*dx+dy*dy;
+    if(l2<0.0001) continue;
+    const t=Math.max(0,Math.min(1,((xm-p1.x)*dx+(ym-p1.y)*dy)/l2));
+    const px=p1.x+t*dx,py=p1.y+t*dy,d=Math.hypot(xm-px,ym-py);
+    if(d<best.dist) best={x:px,y:py,edgeIdx:i,t,dist:d};
   }
   return best;
 }
 
-// Walk perimeter from edge+t position by arc length, returning path points
+// Perimeter position (scalar distance from vertex 0, clockwise)
+function perimScalar(polyM:{x:number,y:number}[],edgeIdx:number,t:number):number{
+  const n=polyM.length;
+  let pos=0;
+  for(let i=0;i<edgeIdx;i++) pos+=Math.hypot(polyM[(i+1)%n].x-polyM[i].x,polyM[(i+1)%n].y-polyM[i].y);
+  const p1=polyM[edgeIdx],p2=polyM[(edgeIdx+1)%n];
+  pos+=t*Math.hypot(p2.x-p1.x,p2.y-p1.y);
+  return pos;
+}
+
+// Walk perimeter between two positions, return path points
 function walkPerimeter(
   polyM:{x:number,y:number}[],
-  fromEdge:number, fromT:number,
-  toEdge:number,   toT:number,
-  clockwise:boolean
-): {x:number,y:number}[] {
-  const n = polyM.length;
-  const pts: {x:number,y:number}[] = [];
-
-  // Start point on edge
-  const p1s=polyM[fromEdge], p2s=polyM[(fromEdge+1)%n];
-  pts.push({x:p1s.x+(p2s.x-p1s.x)*fromT, y:p1s.y+(p2s.y-p1s.y)*fromT});
-
-  if (clockwise) {
-    let e = fromEdge;
-    while (true) {
-      const nextE = (e+1)%n;
-      if (nextE === toEdge) {
-        // Add end of this edge (= start of toEdge)
-        pts.push({x:polyM[nextE].x, y:polyM[nextE].y});
-        break;
-      }
-      if (e === toEdge) break;
-      pts.push({x:polyM[nextE].x, y:polyM[nextE].y});
-      e = nextE;
-      if (e === fromEdge) break; // full loop guard
-    }
-  } else {
-    let e = fromEdge;
-    while (true) {
-      if (e === toEdge) break;
-      pts.push({x:polyM[e].x, y:polyM[e].y});
-      e = (e-1+n)%n;
-      if (e === fromEdge) break;
-    }
+  fromEdge:number,fromT:number,
+  toEdge:number,  toT:number
+):{x:number,y:number}[]{
+  const n=polyM.length;
+  const pts:[{x:number,y:number}]=[] as any;
+  const p1s=polyM[fromEdge],p2s=polyM[(fromEdge+1)%n];
+  pts.push({x:p1s.x+(p2s.x-p1s.x)*fromT,y:p1s.y+(p2s.y-p1s.y)*fromT});
+  let e=fromEdge;
+  let guard=0;
+  while(e!==toEdge&&guard++<n*2){
+    e=(e+1)%n;
+    pts.push({x:polyM[e].x,y:polyM[e].y});
   }
-
-  // End point on toEdge
-  const p1t=polyM[toEdge], p2t=polyM[(toEdge+1)%n];
-  pts.push({x:p1t.x+(p2t.x-p1t.x)*toT, y:p1t.y+(p2t.y-p1t.y)*toT});
-
+  const p1t=polyM[toEdge],p2t=polyM[(toEdge+1)%n];
+  pts.push({x:p1t.x+(p2t.x-p1t.x)*toT,y:p1t.y+(p2t.y-p1t.y)*toT});
   return pts;
 }
 
-// Perimeter distance between two edge positions
-function perimeterDist(
-  polyM:{x:number,y:number}[],
-  fromEdge:number, fromT:number,
-  toEdge:number,   toT:number,
-  clockwise:boolean
-): number {
-  const path = walkPerimeter(polyM, fromEdge, fromT, toEdge, toT, clockwise);
-  let d=0;
-  for(let i=1;i<path.length;i++) d+=Math.hypot(path[i].x-path[i-1].x, path[i].y-path[i-1].y);
-  return d;
+// Emit pipe segments along a path
+function pathToPipes(
+  pts:{x:number,y:number}[],
+  type:'main'|'branch',
+  circIdx:number
+):Pipe[]{
+  const out:Pipe[]=[];
+  for(let i=0;i<pts.length-1;i++){
+    const d=Math.hypot(pts[i+1].x-pts[i].x,pts[i+1].y-pts[i].y);
+    if(d<0.01) continue;
+    out.push({from:{x:pts[i].x,y:pts[i].y},to:{x:pts[i+1].x,y:pts[i+1].y},type,circIdx,lengthM:d});
+  }
+  return out;
 }
 
-// Nearest point on perimeter to a point (inset by insetM toward interior)
-function perimeterInset(
-  xm:number,ym:number,
-  polyM:{x:number,y:number}[],
-  insetM:number
-): {x:number,y:number,edgeIdx:number,t:number} {
-  const pp=nearestPerimeterPoint(xm,ym,polyM);
-  if(insetM<=0) return pp;
-  // Move inset toward the original point
-  const dx=xm-pp.x, dy=ym-pp.y, d=Math.hypot(dx,dy);
-  if(d<0.001) return pp;
-  const f=Math.min(insetM,d)/d;
-  return {...pp, x:pp.x+dx*f, y:pp.y+dy*f};
+// Build "comb" lateral pattern for one circuit:
+//   - Sort heads into rows (by Y)
+//   - For each row: one spine segment, drops to each head
+function buildCircuitLaterals(
+  valve:{x:number,y:number},
+  heads:{xm:number,ym:number}[],
+  circIdx:number
+):Pipe[]{
+  if(!heads.length) return [];
+  const out:Pipe[]=[];
+
+  // Group heads into rows by Y proximity (within 1.5m = same row)
+  const ROW_THRESH=1.5;
+  const sorted=[...heads].sort((a,b)=>a.ym-b.ym);
+  const rows:{xm:number,ym:number}[][]=[];
+  sorted.forEach(h=>{
+    const last=rows[rows.length-1];
+    if(last&&Math.abs(h.ym-last[0].ym)<ROW_THRESH) last.push(h);
+    else rows.push([h]);
+  });
+
+  // For each row: find leftmost and rightmost X, draw spine, drop perpendiculars
+  rows.forEach(row=>{
+    const rowY=row.reduce((s,h)=>s+h.ym,0)/row.length; // avg Y of row
+    row.sort((a,b)=>a.xm-b.xm);
+    const xMin=row[0].xm, xMax=row[row.length-1].xm;
+
+    // Find nearest head in this row to valve = spine entry point
+    const entryHead=row.reduce((best,h)=>
+      Math.hypot(h.xm-valve.x,h.ym-valve.y)<Math.hypot(best.xm-valve.x,best.ym-valve.y)?h:best
+    ,row[0]);
+
+    // Spine: horizontal line from xMin to xMax at rowY
+    if(xMax-xMin>0.1){
+      out.push({from:{x:xMin,y:rowY},to:{x:xMax,y:rowY},type:'branch',circIdx,lengthM:xMax-xMin});
+    }
+
+    // Drop from spine to each head (vertical or short diagonal)
+    row.forEach(h=>{
+      const dy=Math.abs(h.ym-rowY);
+      if(dy>0.05){
+        out.push({from:{x:h.xm,y:rowY},to:{x:h.xm,y:h.ym},type:'branch',circIdx,lengthM:dy});
+      }
+    });
+
+    // Connect valve to spine entry (one feed per row)
+    const feedDist=Math.hypot(entryHead.xm-valve.x,rowY-valve.y);
+    if(feedDist>0.1){
+      out.push({from:{x:valve.x,y:valve.y},to:{x:entryHead.xm,y:rowY},type:'branch',circIdx,lengthM:feedDist});
+    }
+  });
+
+  return out;
 }
 
-// Build complete pipe network
 function buildPipeNetwork(
-  sps: {xm:number,ym:number,circIdx:number}[],
-  source: {xm:number,ym:number},
-  polyM: {x:number,y:number}[],
-  nCircuits: number
-): Pipe[] {
-  if (!sps.length || polyM.length<3) return [];
+  sps:{xm:number,ym:number,circIdx:number}[],
+  source:{xm:number,ym:number},
+  polyM:{x:number,y:number}[],
+  nCircuits:number
+):Pipe[]{
+  if(!sps.length||polyM.length<3) return [];
 
-  const allPipes: Pipe[] = [];
+  const n=polyM.length;
+  const allPipes:Pipe[]=[];
 
-  // Group sprinklers by circuit, compute zone centroid
-  const groups: {xm:number,ym:number}[][] = Array.from({length:nCircuits}, ()=>[]);
-  sps.forEach(s => { if(s.circIdx<nCircuits) groups[s.circIdx].push({xm:s.xm,ym:s.ym}); });
+  // Group heads by circuit
+  const groups:{xm:number,ym:number}[][]=Array.from({length:nCircuits},()=>[]);
+  sps.forEach(s=>{if(s.circIdx<nCircuits) groups[s.circIdx].push({xm:s.xm,ym:s.ym});});
 
-  // For each circuit: valve = nearest perimeter point to zone centroid
-  const valves: {x:number,y:number,edgeIdx:number,t:number,circIdx:number}[] = [];
+  // Snap SA to nearest perimeter point
+  const srcPP=nearestPerimeterPoint(source.xm,source.ym,polyM);
+  const srcPos=perimScalar(polyM,srcPP.edgeIdx,srcPP.t);
+  const totalPerim=polyM.reduce((s,p,i)=>s+Math.hypot(p.x-polyM[(i+1)%n].x,p.y-polyM[(i+1)%n].y),0);
+
+  // For each circuit: valve = nearest perimeter point to circuit centroid
+  const valves:{x:number,y:number,edgeIdx:number,t:number,circIdx:number,perimPos:number}[]=[];
   groups.forEach((grp,ci)=>{
     if(!grp.length) return;
     const cx=grp.reduce((s,p)=>s+p.xm,0)/grp.length;
     const cy=grp.reduce((s,p)=>s+p.ym,0)/grp.length;
     const pp=nearestPerimeterPoint(cx,cy,polyM);
-    valves.push({...pp, circIdx:ci});
+    const ps=perimScalar(polyM,pp.edgeIdx,pp.t);
+    valves.push({x:pp.x,y:pp.y,edgeIdx:pp.edgeIdx,t:pp.t,circIdx:ci,perimPos:ps});
   });
+
   if(!valves.length) return [];
-
-  // SA position: snap to perimeter
-  const srcPP = nearestPerimeterPoint(source.xm, source.ym, polyM);
-  const srcOnPerim = {x:srcPP.x, y:srcPP.y, edgeIdx:srcPP.edgeIdx, t:srcPP.t};
-
-  // ── Main line: SA → each valve following perimeter ────────
-  // Order valves by clockwise perimeter distance from SA
-  const n=polyM.length;
-  function perimPos(edgeIdx:number,t:number): number {
-    // Perimeter position as linear measure from vertex 0
-    let pos=0;
-    for(let i=0;i<edgeIdx;i++) pos+=Math.hypot(polyM[(i+1)%n].x-polyM[i].x, polyM[(i+1)%n].y-polyM[i].y);
-    const p1=polyM[edgeIdx],p2=polyM[(edgeIdx+1)%n];
-    pos+=t*Math.hypot(p2.x-p1.x,p2.y-p1.y);
-    return pos;
-  }
-  const totalPerim=polyM.reduce((s,p,i)=>s+Math.hypot(p.x-polyM[(i+1)%n].x,p.y-polyM[(i+1)%n].y),0);
-  const srcPos=perimPos(srcOnPerim.edgeIdx,srcOnPerim.t);
 
   // Sort valves by CW distance from SA
   const sortedValves=[...valves].sort((a,b)=>{
-    const da=(perimPos(a.edgeIdx,a.t)-srcPos+totalPerim)%totalPerim;
-    const db=(perimPos(b.edgeIdx,b.t)-srcPos+totalPerim)%totalPerim;
+    const da=(a.perimPos-srcPos+totalPerim)%totalPerim;
+    const db=(b.perimPos-srcPos+totalPerim)%totalPerim;
     return da-db;
   });
 
-  // Build main line path: SA → V1 → V2 → ... following perimeter
-  const mainNodes=[
-    {x:srcOnPerim.x,y:srcOnPerim.y,edgeIdx:srcOnPerim.edgeIdx,t:srcOnPerim.t},
+  // ── MAIN: SA → V1 → V2 → ... along perimeter ─────────────
+  const mainChain=[
+    {x:srcPP.x,y:srcPP.y,edgeIdx:srcPP.edgeIdx,t:srcPP.t},
     ...sortedValves
   ];
-
-  for(let i=0;i<mainNodes.length-1;i++){
-    const from=mainNodes[i], to=mainNodes[i+1];
-    const pathPts=walkPerimeter(polyM, from.edgeIdx,from.t, to.edgeIdx,to.t, true);
-    for(let j=0;j<pathPts.length-1;j++){
-      const segLen=Math.hypot(pathPts[j+1].x-pathPts[j].x, pathPts[j+1].y-pathPts[j].y);
-      if(segLen<0.01) continue;
-      allPipes.push({
-        from:{x:pathPts[j].x,y:pathPts[j].y},
-        to:{x:pathPts[j+1].x,y:pathPts[j+1].y},
-        type:'main',
-        circIdx: sortedValves[Math.min(i,sortedValves.length-1)]?.circIdx ?? 0,
-        lengthM: segLen,
-      });
-    }
+  for(let i=0;i<mainChain.length-1;i++){
+    const from=mainChain[i],to=mainChain[i+1];
+    const pathPts=walkPerimeter(polyM,from.edgeIdx,from.t,to.edgeIdx,to.t);
+    allPipes.push(...pathToPipes(pathPts,'main',
+      sortedValves[Math.min(i,sortedValves.length-1)]?.circIdx??0));
   }
 
-  // ── Laterals: valve → each sprinkler (MST per circuit) ───
-  // Each lateral is a straight line from valve drop to head
-  // Uses a simple MST (Prim) rooted at valve
+  // ── LATERALS: comb pattern per circuit ───────────────────
   groups.forEach((grp,ci)=>{
     if(!grp.length) return;
     const valve=valves.find(v=>v.circIdx===ci);
     if(!valve) return;
-
-    // Prim MST: nodes = [valve, ...heads]
-    const nodes=[{x:valve.x,y:valve.y},...grp.map(s=>({x:s.xm,y:s.ym}))];
-    const visited=new Set([0]);
-    while(visited.size<nodes.length){
-      let bestD=Infinity,bestFrom=-1,bestTo=-1;
-      visited.forEach(vi=>{
-        nodes.forEach((_,j)=>{
-          if(visited.has(j)) return;
-          const d=Math.hypot(nodes[vi].x-nodes[j].x,nodes[vi].y-nodes[j].y);
-          if(d<bestD){bestD=d;bestFrom=vi;bestTo=j;}
-        });
-      });
-      if(bestTo<0) break;
-      visited.add(bestTo);
-      allPipes.push({
-        from:{x:nodes[bestFrom].x,y:nodes[bestFrom].y},
-        to:{x:nodes[bestTo].x,y:nodes[bestTo].y},
-        type:'branch',
-        circIdx:ci,
-        lengthM:bestD,
-      });
-    }
+    allPipes.push(...buildCircuitLaterals({x:valve.x,y:valve.y},grp,ci));
   });
 
   return allPipes;
@@ -468,12 +452,24 @@ function professionalPlace(
         }
         // Interior (near.length===0): stays 360°
 
+        // Clamp radius so coverage never extends outside polygon
+        const dEdge = distToEdge(xm, ym, polyM);
+        const effectiveRadius = near.length > 0
+          ? Math.min(radius, dEdge * 1.05)  // edge/corner: reach boundary
+          : radius;                           // interior: full radius
+
+        const normSA = ((sa % 360) + 360) % 360;
+        let normEA   = ((ea % 360) + 360) % 360;
+        // If ea == sa after normalization, it's a full circle
+        if (normEA === normSA && !(sa === 0 && ea === 360)) normEA = (normSA + 360) % 360;
+
         placed.push({
           id: id++,
-          xm, ym, radius,
+          xm, ym,
+          radius: effectiveRadius,
           circIdx: id % nCircuits,
-          startA: sa,
-          endA:   ea,
+          startA: normSA,
+          endA:   normEA || 360,
           phase:  Math.random(),
         });
       }
@@ -496,10 +492,18 @@ export default function SimulatorClient({project,sprinklerDb,isOwner}:Props) {
   const [sz,  setSz]   = useState({w:900,h:600});
 
   // Polygon — stored in meters, rendered in canvas px
-  const [polyM,      setPolyM]      = useState<Point[]>(project.polygon??[]);
+  // Auto-init polygon from project dimensions if none saved
+  const initPolyM = (project.polygon?.length??0)>=3
+    ? project.polygon!
+    : (project.length_m && project.width_m)
+      ? [{x:0,y:0},{x:project.length_m,y:0},{x:project.length_m,y:project.width_m},{x:0,y:project.width_m}]
+      : [];
+  const [polyM,      setPolyM]      = useState<Point[]>(initPolyM);
   const [polygon,    setPolygon]    = useState<{x:number,y:number}[]>([]);
-  const [polyClosed, setPolyClosed] = useState((project.polygon?.length??0)>=3);
+  const [polyClosed, setPolyClosed] = useState(initPolyM.length>=3);
   const [drawPt,     setDrawPt]     = useState<{x:number,y:number}|null>(null); // live cursor while drawing
+  const [snapPt,     setSnapPt]     = useState<{x:number,y:number}|null>(null); // snap indicator
+  const [drawHistory,setDrawHistory]= useState<{x:number,y:number}[][]>([]); // undo stack
 
   // Sprinklers & pipes
   const [sprinklers, setSprinklers] = useState<PlacedSprinkler[]>(
@@ -514,7 +518,7 @@ export default function SimulatorClient({project,sprinklerDb,isOwner}:Props) {
   const [placingWS,   setPlacingWS]   = useState(false); // click-to-place water source mode
 
   // UI state
-  const [mode,       setMode]       = useState<'draw'|'add'|'move'|'delete'>('add');
+  const [mode,       setMode]       = useState<'draw'|'add'|'move'|'delete'>(()=> (project.polygon??[]).length < 3 ? 'draw' : 'add');
   const [selCirc,    setSelCirc]    = useState(0);
   const [curRadius,  setCurRadius]  = useState(6);
   const [hovSp,      setHovSp]      = useState<number|null>(null);
@@ -524,7 +528,11 @@ export default function SimulatorClient({project,sprinklerDb,isOwner}:Props) {
   const [saving,     setSaving]     = useState(false);
   const [saved,      setSaved]      = useState(false);
   const [activeTab,  setActiveTab]  = useState<'sim'|'pipes'|'report'>('sim');
-  const [msg,        setMsg]        = useState('⚡ Apasă Automat sau desenează forma cu ✏️');
+  const [msg,        setMsg]        = useState(
+    initPolyM.length>=3
+      ? '✅ Formă încărcată! Apasă ⚡ Automat pentru plasare aspersoare.'
+      : '📐 Apasă ⬜ Generează sau ✏️ Desenează forma curții'
+  );
   const [coverage,   setCoverage]   = useState(0);
   const [showPDF,    setShowPDF]    = useState(false); // #13
 
@@ -536,6 +544,16 @@ export default function SimulatorClient({project,sprinklerDb,isOwner}:Props) {
 
   useEffect(()=>{sprRef.current=sprinklers;},[sprinklers]);
   useEffect(()=>{polyMRef.current=polyM;},[polyM]);
+
+  // On first load: convert initial polyM to canvas coords
+  useEffect(()=>{
+    if (polyM.length>=3 && polygon.length===0) {
+      computeScale(sz.w, sz.h, polyM);
+      const pts = polyM.map(p=>({x:oxR.current+p.x*m2pxR.current, y:oyR.current+p.y*m2pxR.current}));
+      setPolygon(pts);
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  },[]);
 
   // ── Scale ─────────────────────────────────────────────────
   const computeScale = useCallback((w:number,h:number,poly:Point[]) => {
@@ -683,21 +701,79 @@ export default function SimulatorClient({project,sprinklerDb,isOwner}:Props) {
       }
     }
 
-    // Vertices
+    // Vertices + labels
     polygon.forEach((p,i)=>{
-      ctx.beginPath(); ctx.arc(p.x,p.y,5,0,Math.PI*2);
-      ctx.fillStyle=i===0&&polygon.length>2?'#FF9800':'#5cb85c';
-      ctx.fill(); ctx.strokeStyle='rgba(255,255,255,0.6)'; ctx.lineWidth=1.5; ctx.stroke();
-      // Segment length labels
-      if (i>0&&polyClosed||i>0) {
+      const isFirst=i===0;
+      const isClose=isFirst&&polygon.length>2&&drawPt&&Math.hypot(drawPt.x-p.x,drawPt.y-p.y)<20;
+      // vertex dot
+      ctx.beginPath(); ctx.arc(p.x,p.y,isClose?9:(isFirst&&polygon.length>2?7:5),0,Math.PI*2);
+      ctx.fillStyle=isClose?'#FF5722':(isFirst&&polygon.length>2?'#FF9800':'#5cb85c');
+      ctx.fill();
+      ctx.strokeStyle='rgba(255,255,255,0.8)'; ctx.lineWidth=1.5; ctx.stroke();
+      // close hint ring
+      if(isFirst&&polygon.length>2&&!polyClosed){
+        ctx.beginPath(); ctx.arc(p.x,p.y,18,0,Math.PI*2);
+        ctx.strokeStyle='rgba(255,152,0,0.4)'; ctx.lineWidth=1; ctx.setLineDash([3,3]); ctx.stroke(); ctx.setLineDash([]);
+      }
+      // segment length label
+      if(i>0){
         const prev=polygon[i-1];
         const lm=Math.hypot(p.x-prev.x,p.y-prev.y)/m2pxR.current;
-        if(lm>0.5){
-          ctx.fillStyle='rgba(200,240,160,0.6)'; ctx.font='8px monospace'; ctx.textAlign='center';
-          ctx.fillText(lm.toFixed(1)+'m',(p.x+prev.x)/2,(p.y+prev.y)/2-6);
+        if(lm>0.3){
+          const mx=(p.x+prev.x)/2, my=(p.y+prev.y)/2;
+          const angle=Math.atan2(p.y-prev.y,p.x-prev.x);
+          ctx.save(); ctx.translate(mx,my); ctx.rotate(angle);
+          ctx.fillStyle='rgba(0,0,0,0.5)'; ctx.beginPath(); ctx.roundRect(-18,-9,36,12,3); ctx.fill();
+          ctx.fillStyle='rgba(220,255,200,0.9)'; ctx.font='bold 8px monospace'; ctx.textAlign='center';
+          ctx.fillText(lm.toFixed(1)+'m',0,1);
+          ctx.restore();
+        }
+        // angle indicator at vertex
+        if(i>0&&i<polygon.length-1||polyClosed){
+          const prev2=polygon[(i-1+polygon.length)%polygon.length];
+          const next=polygon[(i+1)%polygon.length];
+          const a1=Math.atan2(prev2.y-p.y,prev2.x-p.x);
+          const a2=Math.atan2(next.y-p.y,next.x-p.x);
+          let deg=((a2-a1)*180/Math.PI+360)%360;
+          if(deg>180) deg=360-deg;
+          if(deg<175||deg>185){ // only show non-straight angles
+            ctx.save(); ctx.fillStyle='rgba(150,220,150,0.5)'; ctx.font='7px monospace'; ctx.textAlign='center';
+            ctx.fillText(Math.round(deg)+'°',p.x,p.y+18); ctx.restore();
+          }
         }
       }
     });
+
+    // Snap point indicator (grid snap or 45° snap)
+    if(snapPt&&!polyClosed){
+      ctx.save();
+      ctx.beginPath(); ctx.arc(snapPt.x,snapPt.y,6,0,Math.PI*2);
+      ctx.strokeStyle='rgba(100,200,255,0.8)'; ctx.lineWidth=1.5; ctx.stroke();
+      ctx.beginPath();
+      ctx.moveTo(snapPt.x-10,snapPt.y); ctx.lineTo(snapPt.x+10,snapPt.y);
+      ctx.moveTo(snapPt.x,snapPt.y-10); ctx.lineTo(snapPt.x,snapPt.y+10);
+      ctx.strokeStyle='rgba(100,200,255,0.5)'; ctx.lineWidth=1; ctx.stroke();
+      ctx.restore();
+    }
+
+    // Live segment from last point to cursor (with distance)
+    if(drawPt&&polygon.length>0&&!polyClosed){
+      const last=polygon[polygon.length-1];
+      const effective=snapPt??drawPt;
+      const lm=Math.hypot(effective.x-last.x,effective.y-last.y)/m2pxR.current;
+      ctx.save();
+      ctx.strokeStyle='rgba(92,184,92,0.5)'; ctx.lineWidth=1.5; ctx.setLineDash([4,4]);
+      ctx.beginPath(); ctx.moveTo(last.x,last.y); ctx.lineTo(effective.x,effective.y); ctx.stroke();
+      ctx.setLineDash([]);
+      if(lm>0.2){
+        const mx=(last.x+effective.x)/2, my=(last.y+effective.y)/2;
+        ctx.fillStyle='rgba(0,0,0,0.6)'; ctx.beginPath(); ctx.roundRect(mx-16,-10+my,32,13,3); ctx.fill();
+        ctx.fillStyle='rgba(150,230,150,0.9)'; ctx.font='7.5px monospace'; ctx.textAlign='center';
+        ctx.fillText(lm.toFixed(1)+'m',mx,my+1);
+      }
+      ctx.restore();
+    }
+
     ctx.restore();
   }
 
@@ -714,147 +790,167 @@ export default function SimulatorClient({project,sprinklerDb,isOwner}:Props) {
   }
 
   function drawPipesLayer(ctx:CanvasRenderingContext2D) {
-    const FLOW_PER_HEAD = 0.45; // m³/h per sprinkler head (typical)
+    const FLOW_PER_HEAD = 0.45; // m³/h per head
 
-    // ── 1. Draw polygon outline (light, background) ──────────
-    if (polyM.length > 2) {
+    // ── Background: polygon outline ──────────────────────────
+    if(polygon.length>2){
       ctx.save();
-      ctx.strokeStyle='rgba(100,200,100,0.25)'; ctx.lineWidth=1;
-      ctx.setLineDash([4,4]);
-      const pts=polygon;
-      ctx.beginPath(); ctx.moveTo(pts[0].x,pts[0].y);
-      pts.forEach(p=>ctx.lineTo(p.x,p.y)); ctx.closePath(); ctx.stroke();
-      ctx.setLineDash([]);
-      ctx.restore();
+      ctx.strokeStyle='rgba(80,160,80,0.2)'; ctx.lineWidth=1; ctx.setLineDash([5,5]);
+      ctx.beginPath(); polygon.forEach((p,i)=>i===0?ctx.moveTo(p.x,p.y):ctx.lineTo(p.x,p.y));
+      ctx.closePath(); ctx.stroke(); ctx.setLineDash([]); ctx.restore();
     }
 
-    // ── 2. Lateral pipes (circuit color, thin) ───────────────
+    // ── Lateral pipes (comb pattern, per circuit color) ──────
     pipes.filter(p=>p.type==='branch').forEach(p=>{
       const circ=project.circuits[p.circIdx];
       const color=circ?.color??'#4fc3f7';
-      const from=toC(p.from.x,p.from.y), to2=toC(p.to.x,p.to.y);
+      const from=toC(p.from.x,p.from.y),to2=toC(p.to.x,p.to.y);
       ctx.save();
-      // shadow
-      ctx.strokeStyle='rgba(0,0,0,0.3)'; ctx.lineWidth=3; ctx.lineCap='round';
-      ctx.beginPath(); ctx.moveTo(from.x+1,from.y+1); ctx.lineTo(to2.x+1,to2.y+1); ctx.stroke();
-      // line
-      ctx.strokeStyle=color; ctx.lineWidth=1.8;
+      ctx.strokeStyle=color; ctx.lineWidth=2; ctx.lineCap='round'; ctx.lineJoin='round';
       ctx.beginPath(); ctx.moveTo(from.x,from.y); ctx.lineTo(to2.x,to2.y); ctx.stroke();
-      // length tag
-      if(p.lengthM>0.8){
-        const mx=(from.x+to2.x)/2, my=(from.y+to2.y)/2;
-        const angle=Math.atan2(to2.y-from.y,to2.x-from.x);
-        ctx.translate(mx,my); ctx.rotate(angle);
-        ctx.fillStyle=color+'dd'; ctx.font='6px monospace'; ctx.textAlign='center';
-        ctx.fillText(p.lengthM.toFixed(1)+'m',0,-3);
-        ctx.restore(); return;
+      // small length label on longer segments
+      if(p.lengthM>1.5){
+        const mx=(from.x+to2.x)/2,my=(from.y+to2.y)/2;
+        ctx.font='6.5px monospace'; ctx.fillStyle=color+'cc'; ctx.textAlign='center';
+        ctx.fillText(p.lengthM.toFixed(1)+'m',mx,my-4);
       }
       ctx.restore();
     });
 
-    // ── 3. Main pipe (black outline + yellow fill) ───────────
-    // Group consecutive main pipes by circuit for flow labeling
-    const mainGroups: {[ci:number]: Pipe[]} = {};
-    pipes.filter(p=>p.type==='main').forEach(p=>{
-      if(!mainGroups[p.circIdx]) mainGroups[p.circIdx]=[];
-      mainGroups[p.circIdx].push(p);
-    });
+    // ── Main pipe — thick, black outline + color per circuit ─
+    // Draw each circuit's main segment in its own color
+    const circuitColors:string[]=project.circuits.map(c=>c.color??'#f0c040');
 
+    // First pass: black outline
     pipes.filter(p=>p.type==='main').forEach(p=>{
-      const from=toC(p.from.x,p.from.y), to2=toC(p.to.x,p.to.y);
+      const from=toC(p.from.x,p.from.y),to2=toC(p.to.x,p.to.y);
       ctx.save();
-      ctx.lineCap='round'; ctx.lineJoin='round';
-      // Black outline
-      ctx.strokeStyle='#0d0d0d'; ctx.lineWidth=5.5;
+      ctx.strokeStyle='#0a0a0a'; ctx.lineWidth=6; ctx.lineCap='round'; ctx.lineJoin='round';
       ctx.beginPath(); ctx.moveTo(from.x,from.y); ctx.lineTo(to2.x,to2.y); ctx.stroke();
-      // Yellow core
-      ctx.strokeStyle='#f0c040'; ctx.lineWidth=3;
+      ctx.restore();
+    });
+    // Second pass: colored core per circuit
+    pipes.filter(p=>p.type==='main').forEach(p=>{
+      const color=circuitColors[p.circIdx]??'#f0c040';
+      const from=toC(p.from.x,p.from.y),to2=toC(p.to.x,p.to.y);
+      ctx.save();
+      ctx.strokeStyle=color; ctx.lineWidth=3.5; ctx.lineCap='round'; ctx.lineJoin='round';
       ctx.beginPath(); ctx.moveTo(from.x,from.y); ctx.lineTo(to2.x,to2.y); ctx.stroke();
       ctx.restore();
     });
 
-    // Flow labels on main pipe (one per circuit group, at midpoint)
-    Object.entries(mainGroups).forEach(([ciStr,segs])=>{
+    // Flow + length labels on main segments (one per circuit, at midpoint)
+    const mainByCi:{[ci:number]:Pipe[]}={};
+    pipes.filter(p=>p.type==='main').forEach(p=>{
+      if(!mainByCi[p.circIdx]) mainByCi[p.circIdx]=[];
+      mainByCi[p.circIdx].push(p);
+    });
+    Object.entries(mainByCi).forEach(([ciStr,segs])=>{
       const ci=parseInt(ciStr);
-      const nHeads=sprinklers.filter(s=>s.circIdx===ci).length;
-      const flow=(nHeads*FLOW_PER_HEAD).toFixed(2);
-      // Find midpoint of all segs
-      if(!segs.length) return;
+      const nH=sprinklers.filter(s=>s.circIdx===ci).length;
+      const totalLen=segs.reduce((s,p)=>s+p.lengthM,0);
+      const flow=(nH*FLOW_PER_HEAD).toFixed(2);
+      const color=circuitColors[ci]??'#f0c040';
       const mid=segs[Math.floor(segs.length/2)];
-      const from=toC(mid.from.x,mid.from.y), to2=toC(mid.to.x,mid.to.y);
-      const mx=(from.x+to2.x)/2, my=(from.y+to2.y)/2;
+      const from=toC(mid.from.x,mid.from.y),to2=toC(mid.to.x,mid.to.y);
+      const mx=(from.x+to2.x)/2,my=(from.y+to2.y)/2;
       ctx.save();
-      // Background pill
-      ctx.fillStyle='rgba(10,20,10,0.82)';
-      ctx.beginPath(); ctx.roundRect(mx-28,my-10,56,14,4); ctx.fill();
-      ctx.fillStyle='#f0c040'; ctx.font='bold 7.5px monospace'; ctx.textAlign='center';
-      ctx.fillText('D='+flow+'m³/h', mx, my+1);
+      // pill background
+      ctx.fillStyle='rgba(5,15,5,0.88)';
+      ctx.beginPath(); ctx.roundRect(mx-32,my-12,64,16,5); ctx.fill();
+      ctx.fillStyle=color; ctx.font='bold 7px monospace'; ctx.textAlign='center';
+      ctx.fillText('D='+flow+'m³/h  '+totalLen.toFixed(1)+'m',mx,my+1);
       ctx.restore();
     });
 
-    // ── 4. Valve nodes (perimeter, orange-ish) ───────────────
+    // ── Valve markers (on perimeter, colored ring) ───────────
     const groups:{xm:number,ym:number}[][]=Array.from({length:project.circuits.length},()=>[]);
-    sprinklers.forEach(s=>{ if(s.circIdx<project.circuits.length) groups[s.circIdx].push({xm:s.xm,ym:s.ym}); });
+    sprinklers.forEach(s=>{if(s.circIdx<project.circuits.length) groups[s.circIdx].push({xm:s.xm,ym:s.ym});});
     groups.forEach((grp,ci)=>{
       if(!grp.length) return;
       const cx=grp.reduce((s,p)=>s+p.xm,0)/grp.length;
       const cy=grp.reduce((s,p)=>s+p.ym,0)/grp.length;
       const pp=nearestPerimeterPoint(cx,cy,polyM);
       const vc=toC(pp.x,pp.y);
-      const circ=project.circuits[ci];
-      const color=circ?.color??'#ff9800';
+      const color=circuitColors[ci]??'#ff9800';
       ctx.save();
-      // Glow
-      ctx.shadowBlur=8; ctx.shadowColor=color;
-      ctx.beginPath(); ctx.arc(vc.x,vc.y,7,0,Math.PI*2);
-      ctx.fillStyle='#111'; ctx.fill();
+      ctx.shadowBlur=10; ctx.shadowColor=color;
+      // outer ring
+      ctx.beginPath(); ctx.arc(vc.x,vc.y,8,0,Math.PI*2);
+      ctx.fillStyle='#060f06'; ctx.fill();
       ctx.strokeStyle=color; ctx.lineWidth=2.5; ctx.stroke();
       ctx.shadowBlur=0;
-      // Inner fill
+      // inner dot
       ctx.beginPath(); ctx.arc(vc.x,vc.y,3.5,0,Math.PI*2);
       ctx.fillStyle=color; ctx.fill();
-      // Circuit number label
-      ctx.fillStyle='white'; ctx.font='bold 6px sans-serif'; ctx.textAlign='center';
-      ctx.fillText(''+(ci+1), vc.x, vc.y+2.5);
+      // label: V + circuit number
+      ctx.fillStyle='white'; ctx.font='bold 6.5px sans-serif'; ctx.textAlign='center';
+      ctx.fillText('V'+(ci+1),vc.x,vc.y+2.5);
       ctx.restore();
     });
 
-    // ── 5. Sprinkler heads (simplified for pipe view) ────────
+    // ── Sprinkler heads (pipe view — small colored dot) ──────
     sprinklers.forEach(sp=>{
       const circ=project.circuits[sp.circIdx]; if(!circ) return;
       if(!sp.x||!sp.y||!isFinite(sp.x)||!isFinite(sp.y)){
         const c=toC(sp.xm,sp.ym); sp={...sp,x:c.x,y:c.y};
       }
       ctx.save();
-      // Small dot
-      ctx.beginPath(); ctx.arc(sp.x,sp.y,4.5,0,Math.PI*2);
-      ctx.fillStyle='#111'; ctx.fill();
+      ctx.beginPath(); ctx.arc(sp.x,sp.y,5,0,Math.PI*2);
+      ctx.fillStyle='#0a0a0a'; ctx.fill();
       ctx.strokeStyle=circ.color; ctx.lineWidth=2;
       ctx.beginPath(); ctx.arc(sp.x,sp.y,4,0,Math.PI*2); ctx.stroke();
-      ctx.beginPath(); ctx.arc(sp.x,sp.y,1.5,0,Math.PI*2);
+      ctx.beginPath(); ctx.arc(sp.x,sp.y,1.8,0,Math.PI*2);
       ctx.fillStyle=circ.color; ctx.fill();
       ctx.restore();
     });
 
-    // ── 6. SA — water source ─────────────────────────────────
+    // ── SA — water source box ─────────────────────────────────
     const srcM=waterSrc??{
       xm:polyM.reduce((s,p)=>s+p.x,0)/Math.max(polyM.length,1),
       ym:polyM.reduce((s,p)=>s+p.y,0)/Math.max(polyM.length,1)
     };
-    const pp=nearestPerimeterPoint(srcM.xm,srcM.ym,polyM);
-    const srcC=toC(pp.x,pp.y);
+    const saPP=nearestPerimeterPoint(srcM.xm,srcM.ym,polyM);
+    const saC=toC(saPP.x,saPP.y);
     ctx.save();
-    ctx.shadowBlur=12; ctx.shadowColor='#90caf9';
-    // White box (like in reference image)
-    const bw=30,bh=22;
-    ctx.fillStyle='white'; ctx.strokeStyle='#1565c0'; ctx.lineWidth=2;
-    ctx.beginPath(); ctx.roundRect(srcC.x-bw/2,srcC.y-bh/2,bw,bh,4);
+    ctx.shadowBlur=14; ctx.shadowColor='#60a0ff';
+    const bw=34,bh=24;
+    // outer box
+    ctx.fillStyle='white'; ctx.strokeStyle='#1565c0'; ctx.lineWidth=2.5;
+    ctx.beginPath(); ctx.roundRect(saC.x-bw/2,saC.y-bh/2,bw,bh,5);
     ctx.fill(); ctx.stroke();
     ctx.shadowBlur=0;
-    ctx.fillStyle='#1565c0'; ctx.font='bold 9px sans-serif'; ctx.textAlign='center';
-    ctx.fillText('SA', srcC.x, srcC.y+3.5);
+    ctx.fillStyle='#1565c0'; ctx.font='bold 10px sans-serif'; ctx.textAlign='center';
+    ctx.fillText('SA',saC.x,saC.y+4);
+    ctx.restore();
+
+    // ── Legend box ────────────────────────────────────────────
+    const lx=12,ly=sz.h-12-project.circuits.length*16-60;
+    ctx.save();
+    ctx.fillStyle='rgba(5,15,5,0.85)'; ctx.strokeStyle='rgba(80,160,80,0.3)'; ctx.lineWidth=1;
+    ctx.beginPath(); ctx.roundRect(lx,ly,160,project.circuits.length*16+52,6);
+    ctx.fill(); ctx.stroke();
+    ctx.fillStyle='rgba(150,220,150,0.7)'; ctx.font='bold 8px monospace'; ctx.textAlign='left';
+    ctx.fillText('TRASEE IRIGAȚII',lx+8,ly+13);
+    // main pipe legend
+    ctx.fillStyle='#f0c040'; ctx.fillRect(lx+8,ly+22,22,3);
+    ctx.fillStyle='rgba(200,240,160,0.8)'; ctx.font='7.5px monospace';
+    ctx.fillText('Conductă principală',lx+36,ly+26);
+    // per circuit
+    project.circuits.forEach((c,i)=>{
+      const cy2=ly+38+i*16;
+      ctx.fillStyle=c.color; ctx.fillRect(lx+8,cy2,22,2.5);
+      ctx.fillStyle='rgba(200,240,160,0.7)'; ctx.font='7px monospace';
+      const nH=sprinklers.filter(s=>s.circIdx===i).length;
+      ctx.fillText('Circuit '+(i+1)+' — '+nH+' capete',lx+36,cy2+5);
+    });
+    // total
+    const totLen=pipes.reduce((s,p)=>s+p.lengthM,0);
+    ctx.fillStyle='rgba(150,200,150,0.6)'; ctx.font='7px monospace';
+    ctx.fillText('Total conductă: '+totLen.toFixed(1)+'m',lx+8,ly+42+project.circuits.length*16);
     ctx.restore();
   }
+
 
   function drawHeads(ctx:CanvasRenderingContext2D) {
     sprinklers.forEach((sp,i)=>{
@@ -1039,15 +1135,20 @@ export default function SimulatorClient({project,sprinklerDb,isOwner}:Props) {
 
     if (mode==='draw') {
       if (polyClosed) return;
-      if (polygon.length>2&&Math.hypot(x-polygon[0].x,y-polygon[0].y)<15) {
+      // Snap: use snapPt if available
+      const sx = snapPt?.x ?? x;
+      const sy = snapPt?.y ?? y;
+      if (polygon.length>2&&Math.hypot(sx-polygon[0].x,sy-polygon[0].y)<20) {
         // Close polygon
         const newPolyM=polygon.map(p=>toM(p.x,p.y));
-        setPolyClosed(true);
-        setPolyM(newPolyM);
-        setMode('add');
+        setPolyClosed(true); setPolyM(newPolyM);
+        setMode('add'); setDrawPt(null); setSnapPt(null);
         setMsg('✅ Formă definită! Apasă ⚡ Automat.');
       } else {
-        setPolygon(prev=>[...prev,{x,y}]);
+        // Save to undo history
+        setDrawHistory(h=>[...h, polygon]);
+        setPolygon(prev=>[...prev,{x:sx,y:sy}]);
+        setMsg('Punct '+( polygon.length+1)+' adăugat · Dublu-click sau click pe ⬤ = închide · Ctrl+Z = anulează');
       }
     } else if (mode==='add') {
       // #6 — Manual add
@@ -1077,11 +1178,34 @@ export default function SimulatorClient({project,sprinklerDb,isOwner}:Props) {
     }
   }
 
+  function handleKeyDown(e:React.KeyboardEvent<HTMLCanvasElement>) {
+    // Ctrl+Z / Cmd+Z — undo last polygon point
+    if((e.ctrlKey||e.metaKey)&&e.key==='z'&&mode==='draw'&&!polyClosed){
+      e.preventDefault();
+      if(drawHistory.length>0){
+        const prev=drawHistory[drawHistory.length-1];
+        setPolygon(prev);
+        setDrawHistory(h=>h.slice(0,-1));
+        setMsg('Punct anulat. '+prev.length+' puncte rămase.');
+      }
+    }
+    // Escape — cancel drawing
+    if(e.key==='Escape'&&mode==='draw'){
+      setPolygon([]); setPolyM([]); setDrawHistory([]);
+      setDrawPt(null); setSnapPt(null);
+      setMsg('Desenare anulată.');
+    }
+  }
+
   function handleDblClick(e:React.MouseEvent<HTMLCanvasElement>) {
     if(mode==='draw'&&!polyClosed&&polygon.length>2){
-      const newPolyM=polygon.map(p=>toM(p.x,p.y));
+      // Remove the extra point added by the preceding click
+      const pts=polygon.slice(0,-1);
+      const newPolyM=pts.map(p=>toM(p.x,p.y));
+      setPolygon(pts);
       setPolyClosed(true); setPolyM(newPolyM);
-      setMode('add'); setMsg('✅ Formă definită! Apasă ⚡ Automat.');
+      setMode('add'); setDrawPt(null); setSnapPt(null);
+      setMsg('✅ Formă definită! '+newPolyM.length+' vârfuri · Apasă ⚡ Automat.');
     }
   }
 
@@ -1098,8 +1222,37 @@ export default function SimulatorClient({project,sprinklerDb,isOwner}:Props) {
 
   function handleMouseMove(e:React.MouseEvent<HTMLCanvasElement>) {
     const {x,y}=getPos(e);
-    if(mode==='draw'&&!polyClosed) setDrawPt({x,y});
-    else setDrawPt(null);
+    if(mode==='draw'&&!polyClosed){
+      setDrawPt({x,y});
+      // Snap logic: 45° angle snap + close-to-existing-vertex snap
+      let snapped:{x:number,y:number}|null=null;
+      const SNAP_PX=12;
+      // 1. Snap to first vertex (close polygon)
+      if(polygon.length>2&&Math.hypot(x-polygon[0].x,y-polygon[0].y)<SNAP_PX*1.5){
+        snapped={x:polygon[0].x,y:polygon[0].y};
+      }
+      // 2. Snap to existing vertices
+      if(!snapped){
+        for(const p of polygon){
+          if(Math.hypot(x-p.x,y-p.y)<SNAP_PX){snapped={x:p.x,y:p.y};break;}
+        }
+      }
+      // 3. Angle snap: constrain to 45° increments from last point
+      if(!snapped&&polygon.length>0){
+        const last=polygon[polygon.length-1];
+        const dx=x-last.x,dy=y-last.y;
+        const angle=Math.atan2(dy,dx);
+        const snapAngle=Math.round(angle/(Math.PI/4))*(Math.PI/4);
+        const dist=Math.hypot(dx,dy);
+        const dAngle=Math.abs(angle-snapAngle);
+        if(dAngle<0.15||Math.abs(dAngle-Math.PI*2)<0.15){ // within ~8.6°
+          snapped={x:last.x+Math.cos(snapAngle)*dist, y:last.y+Math.sin(snapAngle)*dist};
+        }
+      }
+      setSnapPt(snapped);
+    } else {
+      setDrawPt(null); setSnapPt(null);
+    }
 
     // #12 — drag water source
     if(draggingWS&&waterSrc){
@@ -1206,22 +1359,107 @@ export default function SimulatorClient({project,sprinklerDb,isOwner}:Props) {
         {/* Sidebar */}
         <aside className="w-56 flex-shrink-0 border-r border-green-900 overflow-y-auto p-2.5 flex flex-col gap-2">
 
-          {/* Formă */}
+          {/* ── Formă curte ─────────────────────────────── */}
           <SbCard title="📐 Formă curte">
-            <SbBtn onClick={()=>{
-              setMode('draw');setPolyClosed(false);setPolygon([]);setPolyM([]);
-              setMsg('Click = adaugă punct · Dublu-click sau click pe primul punct = închide');
-            }}>✏️ Desenează formă</SbBtn>
-            <div className="text-green-700 text-[10px] px-1">
-              Orice formă: dreptunghi, L, U, trapez, poligon liber (#4 · #11)
-            </div>
-            {polyClosed&&(
-              <SbBtn danger onClick={()=>{
-                setPolyClosed(false);setPolygon([]);setPolyM([]);
-                setSprinklers([]);setPipes([]);setCoverage(0);setWaterSrc(null);
-                computeScale(sz.w,sz.h,[]);
-                setMsg('Formă ștearsă. Desenează una nouă.');
-              }}>🗑 Șterge forma</SbBtn>
+
+            {/* NOT YET DRAWN — primary CTA */}
+            {!polyClosed && mode!=='draw' && (
+              <SbBtn highlight onClick={()=>{
+                setMode('draw'); setPolyClosed(false); setPolygon([]); setPolyM([]);
+                setDrawHistory([]); setSnapPt(null);
+                setMsg('✏️ Click pe canvas = adaugă vârf · Dublu-click = închide forma');
+              }}>✏️ Desenează forma curții</SbBtn>
+            )}
+
+            {/* DRAWING IN PROGRESS */}
+            {mode==='draw' && !polyClosed && (
+              <>
+                <div className="bg-green-950 border border-green-700 rounded-lg p-2 text-[10px] text-green-300 space-y-1 leading-relaxed">
+                  <div className="text-green-400 font-semibold mb-1">Mod desenare activ ✏️</div>
+                  <div><kbd className="bg-green-800 px-1 rounded text-[9px]">Click</kbd> adaugă vârf</div>
+                  <div><kbd className="bg-green-800 px-1 rounded text-[9px]">2× Click</kbd> sau <kbd className="bg-green-800 px-1 rounded text-[9px]">Click ⬤</kbd> închide</div>
+                  <div><kbd className="bg-green-800 px-1 rounded text-[9px]">Ctrl+Z</kbd> anulează ultimul punct</div>
+                  <div><kbd className="bg-green-800 px-1 rounded text-[9px]">Esc</kbd> anulează tot</div>
+                  <div className="text-green-600 pt-0.5 border-t border-green-800 mt-1">Snap automat 45° · orice formă</div>
+                </div>
+
+                {/* Point counter + undo/close */}
+                <div className="flex items-center justify-between px-0.5">
+                  <span className="text-green-600 text-[10px]">{polygon.length} vârfuri</span>
+                  <div className="flex gap-1">
+                    <SbBtn onClick={()=>{
+                      if(drawHistory.length>0){
+                        setPolygon(drawHistory[drawHistory.length-1]);
+                        setDrawHistory(h=>h.slice(0,-1));
+                      } else {
+                        setPolygon([]); setPolyM([]);
+                        setMsg('Desenare anulată.');
+                      }
+                    }}>↩</SbBtn>
+                    {polygon.length>=3 && (
+                      <SbBtn highlight onClick={()=>{
+                        const pts = polygon.length>0 ? polygon : [];
+                        const newPolyM = pts.map(p=>toM(p.x,p.y));
+                        setPolygon(pts); setPolyClosed(true); setPolyM(newPolyM);
+                        setMode('add'); setDrawPt(null); setSnapPt(null);
+                        setMsg('✅ Formă cu '+newPolyM.length+' vârfuri. Apasă ⚡ Automat.');
+                      }}>✓ Închide</SbBtn>
+                    )}
+                  </div>
+                </div>
+
+                {/* Shape templates */}
+                <div className="text-green-700 text-[9px] px-0.5 mt-0.5">Forme rapide:</div>
+                <div className="grid grid-cols-3 gap-1">
+                  {[
+                    {label:'L',pts:[[0,0],[10,0],[10,5],[5,5],[5,10],[0,10]]},
+                    {label:'U',pts:[[0,0],[3,0],[3,7],[7,7],[7,0],[10,0],[10,10],[0,10]]},
+                    {label:'T',pts:[[3,0],[7,0],[7,4],[10,4],[10,7],[7,7],[7,10],[3,10],[3,7],[0,7],[0,4],[3,4]]},
+                  ].map(({label,pts})=>(
+                    <button key={label}
+                      className="text-[10px] py-1 rounded border border-green-800 text-green-500 hover:border-green-500 hover:text-green-300 transition-all font-mono"
+                      onClick={()=>{
+                        const scale=Math.min(sz.w,sz.h)*0.6/10;
+                        const ox=sz.w*0.2, oy=sz.h*0.15;
+                        const canvPts=pts.map(([x,y])=>({x:ox+x*scale, y:oy+y*scale}));
+                        const mPts=canvPts.map(p=>toM(p.x,p.y));
+                        setPolygon(canvPts); setPolyM(mPts);
+                        setPolyClosed(true); setMode('add');
+                        computeScale(sz.w,sz.h,mPts);
+                        setMsg('Formă '+label+' aplicată. Poți modifica sau apăsa ⚡ Automat.');
+                      }}>
+                      {label}
+                    </button>
+                  ))}
+                </div>
+              </>
+            )}
+
+            {/* DRAWN — show info + redraw */}
+            {polyClosed && (
+              <>
+                <div className="bg-green-950/60 rounded-lg p-2 border border-green-800">
+                  <div className="flex items-center gap-1.5 mb-1">
+                    <span className="w-2 h-2 rounded-full bg-green-400 flex-shrink-0"/>
+                    <span className="text-green-300 text-[10px] font-semibold">Formă definită</span>
+                  </div>
+                  <div className="text-green-500 text-[10px] font-mono">
+                    {polyM.length} vârfuri · {polyAreaM(polyM).toFixed(0)} m²
+                  </div>
+                </div>
+                <SbBtn onClick={()=>{
+                  setMode('draw'); setPolyClosed(false); setPolygon([]); setPolyM([]);
+                  setSprinklers([]); setPipes([]); setCoverage(0);
+                  setDrawHistory([]); setSnapPt(null);
+                  setMsg('✏️ Redesenează forma curții.');
+                }}>✏️ Redesenează</SbBtn>
+                <SbBtn danger onClick={()=>{
+                  setPolyClosed(false); setPolygon([]); setPolyM([]);
+                  setSprinklers([]); setPipes([]); setCoverage(0); setWaterSrc(null);
+                  computeScale(sz.w,sz.h,[]);
+                  setMsg('Formă ștearsă.');
+                }}>🗑 Șterge tot</SbBtn>
+              </>
             )}
           </SbCard>
 

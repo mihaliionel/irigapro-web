@@ -62,66 +62,51 @@ function distToEdge(xm:number,ym:number, polyM:{x:number,y:number}[]): number {
 }
 
 // ════════════════════════════════════════════════════════════
-// GEOMETRY HELPERS
+// SPRINKLER TYPE SELECTION — based on zone dimensions
+// Industry standard (Rain Bird / Hunter design guides):
+//   Spray fix   → rmax ≤ 5.5m  (small areas < ~5m wide)
+//   Rotativ     → rmax 5-12m   (medium lawns, 5-15m wide)
+//   Impact      → rmax > 12m   (large open areas)
+//   Picurare    → drip zones, garden beds
 // ════════════════════════════════════════════════════════════
 
-// Nearest point on a polygon edge to point (xm,ym)
-function nearestPerimeterPoint(
-  xm:number, ym:number,
-  polyM:{x:number,y:number}[]
-):{x:number,y:number,edgeIdx:number,t:number,dist:number}{
-  let best={x:xm,y:ym,edgeIdx:0,t:0,dist:Infinity};
-  for(let i=0;i<polyM.length;i++){
-    const p1=polyM[i],p2=polyM[(i+1)%polyM.length];
-    const dx=p2.x-p1.x,dy=p2.y-p1.y,l2=dx*dx+dy*dy;
-    if(l2<1e-9) continue;
-    const t=Math.max(0,Math.min(1,((xm-p1.x)*dx+(ym-p1.y)*dy)/l2));
-    const px=p1.x+t*dx,py=p1.y+t*dy,d=Math.hypot(xm-px,ym-py);
-    if(d<best.dist) best={x:px,y:py,edgeIdx:i,t,dist:d};
+function recommendSprinklerType(
+  zoneDim: number, // shorter dimension of the zone in meters
+  sprinklerDb: {type:string,rmin:number,rmax:number,brand:string,model:string,id:string}[]
+): {type:string, radius:number, model:string|null} {
+  // Best practice: use head spacing = 100% of radius (head-to-head coverage)
+  // Choose radius so that 2-4 rows fit in the shorter dimension
+  
+  let targetRadius: number;
+  let preferredType: string;
+  
+  if (zoneDim <= 6) {
+    targetRadius = Math.min(zoneDim * 0.5, 3);
+    preferredType = 'Spray fix';
+  } else if (zoneDim <= 14) {
+    targetRadius = zoneDim * 0.45;
+    preferredType = 'Rotativ';
+  } else {
+    targetRadius = Math.min(zoneDim * 0.4, 12);
+    preferredType = 'Impact';
   }
-  return best;
+  targetRadius = Math.max(1.5, Math.min(15, targetRadius));
+  
+  // Try to find matching model from DB
+  const matches = sprinklerDb.filter(m =>
+    m.type === preferredType &&
+    m.rmin <= targetRadius + 1 &&
+    m.rmax >= targetRadius - 1
+  );
+  const model = matches.length > 0 ? matches[0] : null;
+  
+  return {
+    type: preferredType,
+    radius: model ? (model.rmin + model.rmax) / 2 : targetRadius,
+    model: model ? `${model.brand} ${model.model}` : null
+  };
 }
 
-// Perimeter arc-length from vertex 0 to position (edgeIdx, t)
-function perimScalar(polyM:{x:number,y:number}[],edgeIdx:number,t:number):number{
-  const n=polyM.length;
-  let pos=0;
-  for(let i=0;i<edgeIdx;i++) pos+=Math.hypot(polyM[(i+1)%n].x-polyM[i].x,polyM[(i+1)%n].y-polyM[i].y);
-  const p1=polyM[edgeIdx],p2=polyM[(edgeIdx+1)%n];
-  pos+=t*Math.hypot(p2.x-p1.x,p2.y-p1.y);
-  return pos;
-}
-
-// Walk perimeter CW from A to B, return intermediate points
-function walkPerimeter(
-  polyM:{x:number,y:number}[],
-  fromEdge:number,fromT:number,
-  toEdge:number,toT:number
-):{x:number,y:number}[]{
-  const n=polyM.length;
-  const out:{x:number,y:number}[]=[];
-  const p1s=polyM[fromEdge],p2s=polyM[(fromEdge+1)%n];
-  out.push({x:p1s.x+(p2s.x-p1s.x)*fromT, y:p1s.y+(p2s.y-p1s.y)*fromT});
-  let e=fromEdge,guard=0;
-  while(e!==toEdge&&guard++<n+2){
-    e=(e+1)%n;
-    out.push({x:polyM[e].x,y:polyM[e].y});
-  }
-  const p1t=polyM[toEdge],p2t=polyM[(toEdge+1)%n];
-  out.push({x:p1t.x+(p2t.x-p1t.x)*toT, y:p1t.y+(p2t.y-p1t.y)*toT});
-  return out;
-}
-
-// Convert path points to Pipe segments
-function pathToPipes(pts:{x:number,y:number}[],type:'main'|'branch',circIdx:number):Pipe[]{
-  const out:Pipe[]=[];
-  for(let i=0;i<pts.length-1;i++){
-    const d=Math.hypot(pts[i+1].x-pts[i].x,pts[i+1].y-pts[i].y);
-    if(d<0.005) continue;
-    out.push({from:{x:pts[i].x,y:pts[i].y},to:{x:pts[i+1].x,y:pts[i+1].y},type,circIdx,lengthM:d});
-  }
-  return out;
-}
 
 // ════════════════════════════════════════════════════════════
 // SPRINKLER PLACEMENT
@@ -186,6 +171,20 @@ function arcForEdge(
   return {sa,ea};
 }
 
+// ════════════════════════════════════════════════════════════
+// PROFESSIONAL PLACEMENT — Industry standard approach
+//
+// Industry rule (Hunter/Rain Bird):
+//   "Start with corner heads, then edge heads, then fill interior.
+//    Head-to-head spacing = radius (100% of radius spacing).
+//    Corner heads: 90°. Edge heads: 180°. Interior heads: 360°."
+//
+// Implementation:
+//   Grid origin snapped to polygon bounding box corner so heads
+//   always land exactly on edges and corners of axis-aligned shapes.
+//   For rotated/irregular shapes, snap heads to nearest polygon edge
+//   when within threshold distance.
+// ════════════════════════════════════════════════════════════
 function professionalPlace(
   polyM:{x:number,y:number}[],
   radiusRequested:number,
@@ -195,86 +194,280 @@ function professionalPlace(
 
   const bb=bbox(polyM);
   const W=bb.maxX-bb.minX, H=bb.maxY-bb.minY;
-  const radius=Math.min(radiusRequested,Math.min(W,H)*0.95);
-  const MIN_DIST=radius*0.65; // minimum distance between heads
+  // Clamp radius so we always get heads — min 1m, max fills smallest dim
+  const radius=Math.max(1, Math.min(radiusRequested, Math.min(W,H)*0.49));
+  // Head-to-head spacing = radius (standard: arcs just touch)
+  const STEP = radius;
+  // Snap threshold: head snaps to polygon edge when within this distance
+  const EDGE_SNAP = radius * 0.45;
+  // Minimum separation between any two heads
+  const MIN_SEP = radius * 0.6;
 
-  const placed:Omit<PlacedSprinkler,'x'|'y'>[]=[];
-  let id=0;
+  const placed:Omit<PlacedSprinkler,'x'|'y'>[] = [];
+  let id = 0;
 
-  function addHead(xm:number,ym:number,sa:number,ea:number,r:number){
-    placed.push({id:id++,xm,ym,radius:r,circIdx:0,startA:sa,endA:ea,phase:Math.random()});
+  function tooClose(xm:number,ym:number):boolean {
+    return placed.some(p=>Math.hypot(p.xm-xm,p.ym-ym)<MIN_SEP);
   }
 
-  function tooClose(xm:number,ym:number):boolean{
-    return placed.some(p=>Math.hypot(p.xm-xm,p.ym-ym)<MIN_DIST);
+  // Get closest point on polygon boundary to (xm,ym)
+  function snapToEdge(xm:number,ym:number):{x:number,y:number,d:number}{
+    let best={x:xm,y:ym,d:Infinity};
+    for(let i=0;i<polyM.length;i++){
+      const p1=polyM[i],p2=polyM[(i+1)%polyM.length];
+      const dx=p2.x-p1.x,dy=p2.y-p1.y,l2=dx*dx+dy*dy;
+      if(l2<1e-9) continue;
+      const t=Math.max(0,Math.min(1,((xm-p1.x)*dx+(ym-p1.y)*dy)/l2));
+      const ex=p1.x+t*dx,ey=p1.y+t*dy;
+      const d=Math.hypot(xm-ex,ym-ey);
+      if(d<best.d) best={x:ex,y:ey,d};
+    }
+    return best;
   }
 
-  // ── STEP 1: Vertex heads ──────────────────────────────────
+  // Count how many polygon edges are within EDGE_SNAP of a point
+  function nearEdgeCount(xm:number,ym:number):number{
+    let count=0;
+    for(let i=0;i<polyM.length;i++){
+      const p1=polyM[i],p2=polyM[(i+1)%polyM.length];
+      if(ptToSegDist(xm,ym,p1.x,p1.y,p2.x,p2.y)<EDGE_SNAP) count++;
+    }
+    return count;
+  }
+
+  // Place head: determine arc based on proximity to polygon edges
+  function placeHead(xm:number,ym:number){
+    if(tooClose(xm,ym)) return;
+
+    const nearEdges = nearEdgeCount(xm,ym);
+    let sa=0, ea=360;
+
+    if(nearEdges>=2){
+      // Corner: use arcForVertex-style calculation
+      // Find the two closest vertices and bisect
+      const vertDists = polyM.map((v,i)=>({i,d:Math.hypot(xm-v.x,ym-v.y)}));
+      vertDists.sort((a,b)=>a.d-b.d);
+      const vi = vertDists[0].i;
+      const arc = arcForVertex(vi, polyM);
+      sa=arc.sa; ea=arc.ea;
+    } else if(nearEdges===1){
+      // Edge: find the closest edge and use its inward normal
+      let bestEdge=0, bestD=Infinity;
+      for(let i=0;i<polyM.length;i++){
+        const p1=polyM[i],p2=polyM[(i+1)%polyM.length];
+        const d=ptToSegDist(xm,ym,p1.x,p1.y,p2.x,p2.y);
+        if(d<bestD){bestD=d;bestEdge=i;}
+      }
+      const arc = arcForEdge(polyM[bestEdge],polyM[(bestEdge+1)%polyM.length],polyM);
+      sa=arc.sa; ea=arc.ea;
+    }
+    // Interior: sa=0, ea=360
+
+    placed.push({id:id++,xm,ym,radius,circIdx:0,startA:sa,endA:ea,phase:Math.random()});
+  }
+
+  // ── PHASE 1: Uniform grid (snapped to bbox origin) ────────
+  // Grid starts at bb.minX, bb.minY — this ensures heads land
+  // exactly on axis-aligned polygon edges
+  const nCols = Math.ceil(W/STEP)+1;
+  const nRows = Math.ceil(H/STEP)+1;
+
+  for(let row=0; row<=nRows; row++){
+    // Hex offset for triangular packing (better coverage)
+    const xOffset = row%2===1 ? STEP*0.5 : 0;
+    for(let col=0; col<=nCols; col++){
+      let xm = bb.minX + col*STEP + xOffset;
+      let ym = bb.minY + row*STEP*0.866; // √3/2 vertical spacing
+
+      // Snap to polygon edge if close enough
+      const snap = snapToEdge(xm,ym);
+      if(snap.d < EDGE_SNAP && snap.d > 0.01){
+        xm = snap.x; ym = snap.y;
+      }
+
+      // Must be inside polygon (or on edge after snap)
+      if(!pip({x:xm,y:ym},polyM) && snap.d > 0.05) continue;
+
+      placeHead(xm,ym);
+    }
+  }
+
+  // ── PHASE 2: Ensure all polygon VERTICES have a head ─────
+  // This guarantees corner coverage even if grid missed them
   polyM.forEach((v,i)=>{
-    const {sa,ea}=arcForVertex(i,polyM);
-    addHead(v.x,v.y,sa,ea,radius);
+    if(!tooClose(v.x,v.y)){
+      const {sa,ea}=arcForVertex(i,polyM);
+      placed.push({id:id++,xm:v.x,ym:v.y,radius,circIdx:0,startA:sa,endA:ea,phase:Math.random()});
+    }
   });
 
-  // ── STEP 2: Edge heads ────────────────────────────────────
-  const n=polyM.length;
-  for(let i=0;i<n;i++){
-    const p1=polyM[i],p2=polyM[(i+1)%n];
-    const edgeLen=Math.hypot(p2.x-p1.x,p2.y-p1.y);
-    if(edgeLen<radius*1.5) continue; // edge too short, already covered by vertices
-    const {sa,ea}=arcForEdge(p1,p2,polyM);
-    // How many intermediate heads fit? spacing = radius along edge
-    const nFit=Math.floor(edgeLen/radius);
-    const step=edgeLen/Math.max(nFit,1);
-    for(let j=1;j<nFit;j++){
-      const t=(j*step)/edgeLen;
-      const xm=p1.x+t*(p2.x-p1.x);
-      const ym=p1.y+t*(p2.y-p1.y);
-      if(!tooClose(xm,ym)) addHead(xm,ym,sa,ea,radius);
-    }
-    // Place at midpoint if no intermediate heads and edge long enough
-    if(nFit===0 && edgeLen>radius*1.2){
-      const xm=(p1.x+p2.x)/2, ym=(p1.y+p2.y)/2;
-      if(!tooClose(xm,ym)) addHead(xm,ym,sa,ea,radius);
-    }
-  }
-
-  // ── STEP 3: Interior grid ─────────────────────────────────
-  // Rectangular grid with slight triangular offset on odd rows
-  const vStep=radius*0.866;
-  const hStep=radius;
-  const nRows=Math.ceil(H/vStep)+1;
-  for(let row=0;row<=nRows;row++){
-    const ym=bb.minY+row*vStep+vStep*0.5;
-    if(ym>bb.maxY+vStep) continue;
-    // Hex offset on odd rows
-    const xOff=row%2===1?hStep*0.5:0;
-    const nCols=Math.ceil(W/hStep)+2;
-    for(let col=-1;col<=nCols;col++){
-      const xm=bb.minX+col*hStep+xOff+hStep*0.5;
-      if(xm<bb.minX-hStep||xm>bb.maxX+hStep) continue;
-      if(!pip({x:xm,y:ym},polyM)) continue;
-      if(tooClose(xm,ym)) continue;
-      addHead(xm,ym,0,360,radius);
-    }
-  }
-
-  // Assign circuits in round-robin order
+  // ── PHASE 3: Assign circuits round-robin ─────────────────
+  // Sort by position (top-left to bottom-right) for clean zone grouping
+  placed.sort((a,b)=>a.ym-b.ym||a.xm-b.xm);
   placed.forEach((p,i)=>{ p.circIdx=i%nCircuits; });
 
   return placed;
 }
 
 // ════════════════════════════════════════════════════════════
-// PIPE ROUTING
+// PIPE ROUTING — H-Pattern (Toro/Hunter professional standard)
+// Main: SA → perimeter → each valve
+// Laterals: backbone along dominant axis + perpendicular drops
 // ════════════════════════════════════════════════════════════
+
+function nearestPerimeterPoint(
+  xm:number, ym:number, polyM:{x:number,y:number}[]
+):{x:number,y:number,edgeIdx:number,t:number,dist:number}{
+  let best={x:xm,y:ym,edgeIdx:0,t:0,dist:Infinity};
+  for(let i=0;i<polyM.length;i++){
+    const p1=polyM[i],p2=polyM[(i+1)%polyM.length];
+    const dx=p2.x-p1.x,dy=p2.y-p1.y,l2=dx*dx+dy*dy;
+    if(l2<1e-9) continue;
+    const t=Math.max(0,Math.min(1,((xm-p1.x)*dx+(ym-p1.y)*dy)/l2));
+    const px=p1.x+t*dx,py=p1.y+t*dy,d=Math.hypot(xm-px,ym-py);
+    if(d<best.dist) best={x:px,y:py,edgeIdx:i,t,dist:d};
+  }
+  return best;
+}
+
+function perimScalar(polyM:{x:number,y:number}[],edgeIdx:number,t:number):number{
+  const n=polyM.length;
+  let pos=0;
+  for(let i=0;i<edgeIdx;i++) pos+=Math.hypot(polyM[(i+1)%n].x-polyM[i].x,polyM[(i+1)%n].y-polyM[i].y);
+  const p1=polyM[edgeIdx],p2=polyM[(edgeIdx+1)%n];
+  pos+=t*Math.hypot(p2.x-p1.x,p2.y-p1.y);
+  return pos;
+}
+
+function walkPerimeter(polyM:{x:number,y:number}[],fromEdge:number,fromT:number,toEdge:number,toT:number):{x:number,y:number}[]{
+  const n=polyM.length;
+  const out:{x:number,y:number}[]=[];
+  const p1s=polyM[fromEdge],p2s=polyM[(fromEdge+1)%n];
+  out.push({x:p1s.x+(p2s.x-p1s.x)*fromT, y:p1s.y+(p2s.y-p1s.y)*fromT});
+  let e=fromEdge,guard=0;
+  while(e!==toEdge&&guard++<n+2){ e=(e+1)%n; out.push({x:polyM[e].x,y:polyM[e].y}); }
+  const p1t=polyM[toEdge],p2t=polyM[(toEdge+1)%n];
+  out.push({x:p1t.x+(p2t.x-p1t.x)*toT, y:p1t.y+(p2t.y-p1t.y)*toT});
+  return out;
+}
+
+function pathToPipes(pts:{x:number,y:number}[],type:'main'|'branch',circIdx:number):Pipe[]{
+  const out:Pipe[]=[];
+  for(let i=0;i<pts.length-1;i++){
+    const d=Math.hypot(pts[i+1].x-pts[i].x,pts[i+1].y-pts[i].y);
+    if(d<0.005) continue;
+    out.push({from:{x:pts[i].x,y:pts[i].y},to:{x:pts[i+1].x,y:pts[i+1].y},type,circIdx,lengthM:d});
+  }
+  return out;
+}
+
+// ════════════════════════════════════════════════════════════
+// H-PATTERN PIPE ROUTING (Toro/Hunter professional standard)
 //
-// Matches reference image exactly:
-// • Thick black main line follows perimeter from SA through all valves
-// • Per circuit: coloured lateral line connects valve to all heads
-//   using a clean row-by-row "spine + drop" pattern
-// • Valves = orange circles on perimeter
-// • SA = white box on perimeter
+// Best practice: "The best pattern of piping looks like an H
+// when designed properly." (Toro Basic Irrigation Design Guide)
+//
+// Per circuit:
+//  1. Find dominant layout axis (wider = horizontal, taller = vertical)
+//  2. Place a single RISER pipe along that axis at the median position
+//  3. Per row (or column): a BRANCH pipe spanning all heads in that row
+//  4. Valve connects to riser via shortest perpendicular stub
+//  5. Riser connects to all row-branches at perpendicular T-intersections
 // ════════════════════════════════════════════════════════════
+function buildCircuitHPattern(
+  valve:{x:number,y:number},
+  heads:{xm:number,ym:number}[],
+  circIdx:number
+):Pipe[]{
+  if(!heads.length) return [];
+  const out:Pipe[]=[];
+
+  const xs = heads.map(h=>h.xm), ys = heads.map(h=>h.ym);
+  const spanX = Math.max(...xs)-Math.min(...xs);
+  const spanY = Math.max(...ys)-Math.min(...ys);
+
+  function pipe(x1:number,y1:number,x2:number,y2:number){
+    const d=Math.hypot(x2-x1,y2-y1);
+    if(d<0.05) return;
+    out.push({from:{x:x1,y:y1},to:{x:x2,y:y2},type:'branch',circIdx,lengthM:d});
+  }
+
+  if(spanX >= spanY){
+    // ── Horizontal layout: rows by Y, riser is vertical ──
+    // Sort into rows (Y tolerance = 1.2m for hex grid)
+    const sorted = [...heads].sort((a,b)=>a.ym-b.ym);
+    const rows:{xm:number,ym:number}[][] = [];
+    sorted.forEach(h=>{
+      const last=rows[rows.length-1];
+      if(last && Math.abs(h.ym-last[0].ym)<1.2) last.push(h);
+      else rows.push([h]);
+    });
+
+    if(!rows.length) return [];
+
+    // Riser X = median X of all heads (minimises total branch length)
+    const sortedXs = [...xs].sort((a,b)=>a-b);
+    const riserX = sortedXs[Math.floor(sortedXs.length/2)];
+
+    // Row Y values
+    const rowYs = rows.map(row => row.reduce((s,h)=>s+h.ym,0)/row.length);
+
+    // Riser: vertical pipe spanning all rows
+    const riserTopY = Math.min(...rowYs);
+    const riserBotY = Math.max(...rowYs);
+    pipe(riserX, riserTopY, riserX, riserBotY);
+
+    // Row branches: horizontal pipe from leftmost to rightmost head per row
+    rows.forEach((row, ri)=>{
+      row.sort((a,b)=>a.xm-b.xm);
+      const rowY = rowYs[ri];
+      const xMin = row[0].xm, xMax = row[row.length-1].xm;
+      // Horizontal branch spanning this row
+      if(row.length > 1) pipe(xMin, rowY, xMax, rowY);
+      // T-connection from riser to this row
+      pipe(riserX, rowY, xMin < riserX ? xMin : xMax, rowY);
+    });
+
+    // Valve → riser: horizontal stub + connect to nearest row
+    const nearestRowY = rowYs.reduce((best,ry)=>Math.abs(ry-valve.y)<Math.abs(best-valve.y)?ry:best, rowYs[0]);
+    pipe(valve.x, valve.y, riserX, valve.y);  // horizontal to riser X
+    pipe(riserX, valve.y, riserX, nearestRowY); // vertical down/up to nearest row
+
+  } else {
+    // ── Vertical layout: columns by X, riser is horizontal ──
+    const sorted = [...heads].sort((a,b)=>a.xm-b.xm);
+    const cols:{xm:number,ym:number}[][] = [];
+    sorted.forEach(h=>{
+      const last=cols[cols.length-1];
+      if(last && Math.abs(h.xm-last[0].xm)<1.2) last.push(h);
+      else cols.push([h]);
+    });
+
+    if(!cols.length) return [];
+
+    const sortedYs = [...ys].sort((a,b)=>a-b);
+    const riserY = sortedYs[Math.floor(sortedYs.length/2)];
+
+    const colXs = cols.map(col => col.reduce((s,h)=>s+h.xm,0)/col.length);
+    const riserLeftX = Math.min(...colXs);
+    const riserRightX = Math.max(...colXs);
+    pipe(riserLeftX, riserY, riserRightX, riserY);
+
+    cols.forEach((col, ci)=>{
+      col.sort((a,b)=>a.ym-b.ym);
+      const colX = colXs[ci];
+      const yMin = col[0].ym, yMax = col[col.length-1].ym;
+      if(col.length > 1) pipe(colX, yMin, colX, yMax);
+      pipe(colX, riserY, colX, yMin < riserY ? yMin : yMax);
+    });
+
+    const nearestColX = colXs.reduce((best,cx)=>Math.abs(cx-valve.x)<Math.abs(best-valve.x)?cx:best, colXs[0]);
+    pipe(valve.x, valve.y, valve.x, riserY);
+    pipe(valve.x, riserY, nearestColX, riserY);
+  }
+
+  return out;
+}
 
 function buildPipeNetwork(
   sps:{xm:number,ym:number,circIdx:number}[],
@@ -285,17 +478,11 @@ function buildPipeNetwork(
   if(!sps.length||polyM.length<3) return [];
   const n=polyM.length;
   const allPipes:Pipe[]=[];
-
-  // Group heads by circuit
   const groups:{xm:number,ym:number}[][]=Array.from({length:nCircuits},()=>[]);
   sps.forEach(s=>{if(s.circIdx<nCircuits) groups[s.circIdx].push({xm:s.xm,ym:s.ym});});
-
-  // SA on perimeter
   const srcPP=nearestPerimeterPoint(source.xm,source.ym,polyM);
   const srcPos=perimScalar(polyM,srcPP.edgeIdx,srcPP.t);
   const totalPerim=polyM.reduce((s,p,i)=>s+Math.hypot(p.x-polyM[(i+1)%n].x,p.y-polyM[(i+1)%n].y),0);
-
-  // Each circuit valve = perimeter point nearest to circuit centroid
   const valves:{x:number,y:number,edgeIdx:number,t:number,circIdx:number,ps:number}[]=[];
   groups.forEach((grp,ci)=>{
     if(!grp.length) return;
@@ -305,93 +492,67 @@ function buildPipeNetwork(
     valves.push({x:pp.x,y:pp.y,edgeIdx:pp.edgeIdx,t:pp.t,circIdx:ci,ps:perimScalar(polyM,pp.edgeIdx,pp.t)});
   });
   if(!valves.length) return [];
-
-  // Sort valves CW from SA
   const sortedValves=[...valves].sort((a,b)=>{
     const da=(a.ps-srcPos+totalPerim)%totalPerim;
     const db=(b.ps-srcPos+totalPerim)%totalPerim;
     return da-db;
   });
-
-  // ── Main trunk: SA → V1 → V2 → … along perimeter ─────────
-  const chain:[{x:number,y:number,edgeIdx:number,t:number}]=[
-    {x:srcPP.x,y:srcPP.y,edgeIdx:srcPP.edgeIdx,t:srcPP.t},
-    ...sortedValves
-  ] as any;
+  // Main trunk along perimeter SA → V1 → V2 → …
+  const chain:{x:number,y:number,edgeIdx:number,t:number}[]=[
+    {x:srcPP.x,y:srcPP.y,edgeIdx:srcPP.edgeIdx,t:srcPP.t},...sortedValves
+  ];
   for(let i=0;i<chain.length-1;i++){
     const from=chain[i],to=chain[i+1];
     const pts=walkPerimeter(polyM,from.edgeIdx,from.t,to.edgeIdx,to.t);
     const ci=sortedValves[Math.min(i,sortedValves.length-1)]?.circIdx??0;
     allPipes.push(...pathToPipes(pts,'main',ci));
   }
-
-  // ── Laterals per circuit: row-by-row spine + drops ────────
-  // Sort heads in each circuit by row (Y), then by X within row
-  // Draw a horizontal "spine" per row, drops to each head
+  // H-pattern laterals per circuit
   groups.forEach((grp,ci)=>{
     if(!grp.length) return;
     const valve=valves.find(v=>v.circIdx===ci);
     if(!valve) return;
-
-    // Sort heads by Y first, X second
-    const sorted=[...grp].sort((a,b)=>a.ym-b.ym||a.xm-b.xm);
-
-    // Group into rows (heads within 1m Y are same row)
-    const rows:{xm:number,ym:number}[][]=[];
-    sorted.forEach(h=>{
-      const last=rows[rows.length-1];
-      if(last&&Math.abs(h.ym-last[0].ym)<1.5) last.push(h);
-      else rows.push([h]);
-    });
-
-    // For each row: draw horizontal spine from leftmost to rightmost head
-    // Then connect valve to nearest row-entry point
-    rows.forEach((row,ri)=>{
-      row.sort((a,b)=>a.xm-b.xm);
-      const rowY=row.reduce((s,h)=>s+h.ym,0)/row.length;
-      const xMin=row[0].xm, xMax=row[row.length-1].xm;
-
-      // Spine along the row
-      if(row.length>1){
-        allPipes.push({from:{x:xMin,y:rowY},to:{x:xMax,y:rowY},type:'branch',circIdx:ci,lengthM:Math.abs(xMax-xMin)});
-      }
-
-      // Drops from spine to each head (if head Y differs from rowY)
-      row.forEach(h=>{
-        const dy=Math.abs(h.ym-rowY);
-        if(dy>0.05) allPipes.push({from:{x:h.xm,y:rowY},to:{x:h.xm,y:h.ym},type:'branch',circIdx:ci,lengthM:dy});
-      });
-
-      // Connect valve to this row's spine entry
-      if(ri===0){
-        // First row: direct from valve to nearest head in row
-        const entry=row.reduce((best,h)=>
-          Math.hypot(h.xm-valve.x,h.ym-valve.y)<Math.hypot(best.xm-valve.x,best.ym-valve.y)?h:best,row[0]);
-        allPipes.push({from:{x:valve.x,y:valve.y},to:{x:entry.xm,y:rowY},type:'branch',circIdx:ci,
-          lengthM:Math.hypot(entry.xm-valve.x,rowY-valve.y)});
-      } else {
-        // Subsequent rows: vertical drop from previous row spine
-        const prevRow=rows[ri-1];
-        const prevRowY=prevRow.reduce((s,h)=>s+h.ym,0)/prevRow.length;
-        // Find closest X column between rows
-        const connX=row[0].xm;
-        allPipes.push({from:{x:connX,y:prevRowY},to:{x:connX,y:rowY},type:'branch',circIdx:ci,
-          lengthM:Math.abs(rowY-prevRowY)});
-      }
-    });
+    allPipes.push(...buildCircuitHPattern({x:valve.x,y:valve.y},grp,ci));
   });
-
   return allPipes;
 }
 
 // ════════════════════════════════════════════════════════════
-// SPRINKLER TYPE LABEL  (#5)
+// SPRINKLER TYPE LOGIC
+// Industry standard (Hunter/Rain Bird guidelines):
+//   ≤ 4m radius  → Spray fix     (small areas, flower beds)
+//   4-9m radius  → Rotativ       (medium lawns)
+//   9-15m radius → Jet rotor     (large open areas)
+//   >15m radius  → Impact        (sports fields, agriculture)
+// Zones < 3m wide → always Spray fix regardless of radius
 // ════════════════════════════════════════════════════════════
+
 function sprinklerTypeLabel(radius:number): {label:string, color:string} {
-  if (radius<=3)  return {label:'Spray fix',  color:'#4fc3f7'};
-  if (radius<=6)  return {label:'Spray rot.', color:'#81c784'};
-  if (radius<=10) return {label:'Jet rotor',  color:'#ffb74d'};
-  return              {label:'Impact',      color:'#f06292'};
+  if (radius<=4)  return {label:'Spray fix', color:'#4fc3f7'};
+  if (radius<=9)  return {label:'Rotativ',   color:'#81c784'};
+  if (radius<=15) return {label:'Jet rotor', color:'#ffb74d'};
+  return              {label:'Impact',   color:'#f06292'};
+}
+
+// Choose best radius given polygon dimensions and preferred model
+function autoSelectRadius(
+  polyM:{x:number,y:number}[],
+  preferredModelRadius?: number
+):number {
+  const bb = bbox(polyM);
+  const W = bb.maxX - bb.minX;
+  const H = bb.maxY - bb.minY;
+  const minDim = Math.min(W, H);
+  const area = polyAreaM(polyM);
+
+  if (preferredModelRadius) return Math.min(preferredModelRadius, minDim * 0.45);
+
+  // Auto-select based on area and dimensions
+  if (minDim < 4) return 1.5;          // narrow strip → spray fix
+  if (area < 50)  return 3;            // small yard
+  if (area < 200) return 5;            // medium yard
+  if (area < 500) return 7;            // large yard
+  return 10;                           // very large
 }
 
 
@@ -439,6 +600,7 @@ export default function SimulatorClient({project,sprinklerDb,isOwner}:Props) {
 
   // UI state
   const [mode,       setMode]       = useState<'draw'|'add'|'move'|'delete'>('add');
+  const [selModel,   setSelModel]   = useState<string>('auto'); // 'auto' = auto-select by zone size
   const [selCirc,    setSelCirc]    = useState(0);
   const [curRadius,  setCurRadius]  = useState(6);
   const [hovSp,      setHovSp]      = useState<number|null>(null);
@@ -450,7 +612,7 @@ export default function SimulatorClient({project,sprinklerDb,isOwner}:Props) {
   const [activeTab,  setActiveTab]  = useState<'sim'|'pipes'|'report'>('sim');
   const [msg,        setMsg]        = useState(
     initPolyM.length>=3
-      ? '✅ Formă încărcată! Apasă ⚡ Automat pentru plasare aspersoare.'
+      ? '✅ Formă încărcată! 1) Plasează sursa de apă 💧 2) Apasă ⚡ Automat'
       : '⚠️ Nu există formă. Mergi la Dashboard și creează un proiect nou cu forma desenată.'
   );
   const [coverage,   setCoverage]   = useState(0);
@@ -523,11 +685,13 @@ export default function SimulatorClient({project,sprinklerDb,isOwner}:Props) {
   // ── Pipes from water source (#12) ─────────────────────────
   const recalcPipes = useCallback((sps:PlacedSprinkler[], ws:WaterSource|null)=>{
     if (!sps.length){setPipes([]);return;}
-    const origin = ws ?? {
-      xm: polyM.reduce((s,p)=>s+p.x,0)/Math.max(polyM.length,1),
-      ym: polyM.reduce((s,p)=>s+p.y,0)/Math.max(polyM.length,1)
-    };
-    const result = buildPipeNetwork(sps, origin, polyM, project.circuits.length);
+    // Water source is REQUIRED for pipe routing.
+    // Without it we show a warning but do NOT route.
+    if (!ws) {
+      setPipes([]);
+      return;
+    }
+    const result = buildPipeNetwork(sps, ws, polyM, project.circuits.length);
     setPipes(result);
   },[polyM,project.circuits]);
 
@@ -1004,8 +1168,21 @@ export default function SimulatorClient({project,sprinklerDb,isOwner}:Props) {
   // ── Auto Place ────────────────────────────────────────────
   function autoPlace() {
     if (!polyClosed||polyM.length<3){setMsg('Desenează mai întâi curtea!');return;}
+    if (!waterSrc){
+      setMsg('⚠️ Plasează mai întâi Sursa de Apă (SA) pentru a genera traseele!');
+      return;
+    }
 
-    const raw=professionalPlace(polyM,curRadius,project.circuits.length);
+    // Choose radius: from selected model or auto-select by zone
+    const selM = selModel !== 'auto'
+      ? sprinklerDb.find(m=>m.id===selModel)
+      : null;
+    const useRadius = selM
+      ? autoSelectRadius(polyM, (selM.rmin+selM.rmax)/2)
+      : autoSelectRadius(polyM);
+
+    setCurRadius(useRadius);
+    const raw=professionalPlace(polyM,useRadius,project.circuits.length);
     if(!raw.length){setMsg('Nu s-au putut plasa aspersoare. Încearcă o rază mai mică.');return;}
 
     const placed:PlacedSprinkler[]=raw.map(p=>{
@@ -1017,11 +1194,11 @@ export default function SimulatorClient({project,sprinklerDb,isOwner}:Props) {
     recalcPipes(placed,waterSrc);
     recalcCov(placed);
 
-    const {label}=sprinklerTypeLabel(curRadius);
+    const {label}=sprinklerTypeLabel(useRadius);
     const c90=placed.filter(s=>((s.endA-s.startA+360)%360||360)<=95).length;
     const c180=placed.filter(s=>{const sp=((s.endA-s.startA+360)%360||360);return sp>95&&sp<=185;}).length;
     const c360=placed.filter(s=>((s.endA-s.startA+360)%360||360)>185).length;
-    setMsg(`✅ ${placed.length} aspersoare ${label} · ${c90}×90° · ${c180}×180° · ${c360}×360°`);
+    setMsg(`✅ ${placed.length} aspersoare ${label} (r=${useRadius}m) · ${c90}×90° · ${c180}×180° · ${c360}×360°`);
   }
 
   // ── Canvas events ─────────────────────────────────────────
@@ -1303,31 +1480,71 @@ export default function SimulatorClient({project,sprinklerDb,isOwner}:Props) {
             )}
           </SbCard>
 
-          {/* Aspersor */}
-          <SbCard title="💧 Aspersor">
-            <div className="flex items-center gap-2 text-xs">
-              <span className="text-green-600 w-10">Raza</span>
+          {/* Model aspersor */}
+          <SbCard title="💧 Tip Aspersor">
+            {/* Auto-select badge */}
+            <div className="bg-green-900/40 border border-green-800 rounded-lg p-2 mb-2">
+              <div className="text-[9px] text-green-600 mb-1 uppercase tracking-wider">Recomandat automat</div>
+              <div className="flex items-center gap-2">
+                <span className="text-[10px] px-2 py-0.5 rounded-full font-bold border"
+                  style={{color:spColor,borderColor:spColor+'44',background:spColor+'11'}}>
+                  {spType}
+                </span>
+                <span className="text-green-600 text-[9px]">r={curRadius}m</span>
+              </div>
+            </div>
+
+            {/* Model selector */}
+            <div className="text-[9px] text-green-600 mb-1">Model specific (opțional):</div>
+            <select
+              value={selModel}
+              onChange={e=>{
+                setSelModel(e.target.value);
+                if(e.target.value!=='auto'){
+                  const m=sprinklerDb.find(x=>x.id===e.target.value);
+                  if(m) setCurRadius(Math.round((m.rmin+m.rmax)/2*10)/10);
+                }
+              }}
+              className="w-full text-[10px] bg-green-950 border border-green-800 text-green-200 rounded px-1.5 py-1 focus:border-green-600 outline-none">
+              <option value="auto">⚡ Auto (recomandat)</option>
+              {['Spray fix','Rotativ','Jet rotor','Impact'].map(type=>{
+                const models=sprinklerDb.filter(m=>m.type===type||
+                  (type==='Rotativ'&&m.type==='Rotativ')||
+                  (type==='Spray fix'&&(m.type==='Spray fix'||m.type==='')));
+                if(!models.length) return null;
+                return (
+                  <optgroup key={type} label={`── ${type} ──`}>
+                    {models.map(m=>(
+                      <option key={m.id} value={m.id}>
+                        {m.brand} {m.model} ({m.rmin}–{m.rmax}m)
+                      </option>
+                    ))}
+                  </optgroup>
+                );
+              })}
+            </select>
+
+            {/* Selected model details */}
+            {selModel!=='auto'&&(()=>{
+              const m=sprinklerDb.find(x=>x.id===selModel);
+              if(!m) return null;
+              return (
+                <div className="mt-1.5 bg-green-950 border border-green-800 rounded p-1.5 text-[9px] text-green-500 space-y-0.5">
+                  <div className="flex justify-between"><span>Rază</span><span className="text-green-300 font-mono">{m.rmin}–{m.rmax}m</span></div>
+                  <div className="flex justify-between"><span>Presiune</span><span className="text-green-300 font-mono">{m.pmin}–{m.pmax} bar</span></div>
+                  <div className="flex justify-between"><span>Debit</span><span className="text-green-300 font-mono">{m.flow} m³/h</span></div>
+                  {m.notes&&<div className="text-green-700 italic pt-0.5">{m.notes}</div>}
+                </div>
+              );
+            })()}
+
+            {/* Manual radius override */}
+            <div className="flex items-center gap-2 text-xs mt-2 border-t border-green-900 pt-2">
+              <span className="text-green-700 text-[10px] w-10">Raza</span>
               <input type="range" min={1} max={15} step={0.5} value={curRadius}
-                onChange={e=>setCurRadius(+e.target.value)}
+                onChange={e=>{setCurRadius(+e.target.value);setSelModel('auto');}}
                 className="flex-1 h-1.5 bg-green-800 rounded appearance-none cursor-pointer"/>
               <span className="text-green-300 font-mono font-bold w-10 text-right">{curRadius}m</span>
-            </div>
-            {/* #5 — Sprinkler type badge */}
-            <div className="flex items-center gap-2 mt-1 px-1">
-              <span className="text-[10px] px-2 py-0.5 rounded-full font-bold border"
-                style={{color:spColor,borderColor:spColor+'44',background:spColor+'11'}}>
-                {spType}
-              </span>
-              <span className="text-green-700 text-[10px]">Pas: {curRadius}m · Rând: {(curRadius*0.866).toFixed(1)}m</span>
-            </div>
-            <div className="flex gap-1 mt-1">
-              {[2,3,4,6,9,12].map(r=>(
-                <button key={r} onClick={()=>setCurRadius(r)}
-                  className={`flex-1 text-[10px] py-0.5 rounded border transition-all
-                    ${curRadius===r?'bg-green-700 border-green-500 text-white':'border-green-800 text-green-600 hover:border-green-600'}`}>
-                  {r}m
-                </button>
-              ))}
             </div>
           </SbCard>
 
@@ -1343,32 +1560,43 @@ export default function SimulatorClient({project,sprinklerDb,isOwner}:Props) {
             <SbBtn danger onClick={()=>{setSprinklers([]);setPipes([]);setCoverage(0);setMsg('Toate aspersoarele șterse.');}}>🗑 Șterge toate</SbBtn>
           </SbCard>
 
-          {/* Sursă apă */}
-          <SbCard title="💧 Sursă apă">
+          {/* Sursă apă — MANDATORY */}
+          <SbCard title="💧 Sursă Apă (SA)">
+            {!waterSrc && !placingWS && (
+              <div className="bg-orange-950/60 border border-orange-800 rounded-lg p-2 mb-1.5">
+                <div className="text-[10px] text-orange-400 font-semibold">⚠️ Obligatoriu</div>
+                <div className="text-[9px] text-orange-600 mt-0.5">Plasează SA înainte de a genera traseele</div>
+              </div>
+            )}
             {!placingWS ? (
               <SbBtn highlight={!waterSrc} active={false} onClick={()=>{
                 setPlacingWS(true);
                 setMode('add');
-                setMsg('💧 Click oriunde pe canvas pentru a plasa sursa de apă');
-              }}>💧 {waterSrc ? 'Mută sursa apă' : 'Plasează sursă apă'}</SbBtn>
+                setMsg('💧 Click pe canvas pentru a plasa Sursa de Apă (SA)');
+              }}>
+                {waterSrc ? '🔄 Mută SA' : '💧 Plasează SA'}
+              </SbBtn>
             ) : (
-              <div className="bg-blue-900/50 border border-blue-700 rounded-md px-2 py-1.5 text-xs text-blue-300 flex items-center gap-2">
-                <span className="animate-pulse">💧</span>
+              <div className="bg-blue-900/50 border border-blue-600 rounded-md px-2 py-1.5 text-xs text-blue-200 flex items-center gap-2 animate-pulse">
+                <span>💧</span>
                 <span className="flex-1">Click pe canvas...</span>
-                <button onClick={()=>{setPlacingWS(false);setMsg('Plasare anulată');}} className="text-red-500 hover:text-red-300">✕</button>
+                <button onClick={()=>{setPlacingWS(false);setMsg('Plasare anulată');}} className="text-red-400 hover:text-red-200 animate-none">✕</button>
               </div>
             )}
-            {waterSrc&&(
-              <div className="flex items-center gap-2 px-1">
-                <span className="text-blue-400 text-xs flex-1">📍 {waterSrc.xm.toFixed(1)}m, {waterSrc.ym.toFixed(1)}m</span>
+            {waterSrc && (
+              <div className="bg-blue-950/40 border border-blue-800 rounded p-1.5 mt-1">
+                <div className="flex items-center gap-1.5 mb-0.5">
+                  <span className="w-2 h-2 rounded-full bg-blue-400"/>
+                  <span className="text-[10px] text-blue-300 font-semibold">SA plasat</span>
+                </div>
+                <div className="text-[9px] text-blue-500 font-mono">{waterSrc.xm.toFixed(1)}m, {waterSrc.ym.toFixed(1)}m</div>
                 <button onClick={()=>{setWaterSrc(null);setPlacingWS(false);recalcPipes(sprinklers,null);}}
-                  className="text-red-600 text-[10px] hover:text-red-400 border border-red-900 rounded px-1">Șterge</button>
+                  className="mt-1 w-full text-[9px] text-red-600 hover:text-red-400 border border-red-900 rounded py-0.5 transition-colors">
+                  Șterge SA
+                </button>
               </div>
             )}
-            {!waterSrc&&!placingWS&&(
-              <div className="text-green-700 text-[10px] italic px-1">Neselectată — centroid folosit</div>
-            )}
-            <div className="text-green-800 text-[10px] px-1 mt-0.5">Drag 💧 = mută după plasare</div>
+            <div className="text-green-800 text-[9px] px-0.5 mt-1">Drag SA = mută după plasare</div>
           </SbCard>
 
           {/* Circuite (#9 — show unified) */}
@@ -1552,7 +1780,7 @@ function ReportTab({project,sprinklers,pipes,areaM2,coverage,materials,spType,cu
           <Row l="Raza de acoperire" v={curRadius+'m'}/>
           <Row l="Total aspersoare" v={sprinklers.length+'×'}/>
           {Object.entries(materials.spMap).map(([k,v])=>(
-            <Row key={k} l={'  '+k} v={v+'×'}/>
+            <div key={k}><Row l={'  '+k} v={v+'×'}/></div>
           ))}
           <Row l="Colțuri (90°)" v={sprinklers.filter(s=>((s.endA-s.startA+360)%360||360)<=95).length+'×'}/>
           <Row l="Margini (180°)" v={sprinklers.filter(s=>{const sp=((s.endA-s.startA+360)%360||360);return sp>95&&sp<=185;}).length+'×'}/>

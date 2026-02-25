@@ -62,21 +62,16 @@ function distToEdge(xm:number,ym:number, polyM:{x:number,y:number}[]): number {
 }
 
 // ════════════════════════════════════════════════════════════
-// PIPE ROUTING — Professional, matches reference image
-//
-// SA on perimeter → main trunk follows polygon edge clockwise
-// to each circuit valve (also on perimeter).
-// Per circuit: main lateral runs vertically/horizontally through
-// the zone, with perpendicular branches to each head.
-// Result: minimum trenches, clean parallel layout.
+// GEOMETRY HELPERS
 // ════════════════════════════════════════════════════════════
 
+// Nearest point on a polygon edge to point (xm,ym)
 function nearestPerimeterPoint(
-  xm: number, ym: number,
-  polyM: {x:number,y:number}[]
-): {x:number,y:number,edgeIdx:number,t:number,dist:number} {
-  let best = {x:xm,y:ym,edgeIdx:0,t:0,dist:Infinity};
-  for (let i=0;i<polyM.length;i++){
+  xm:number, ym:number,
+  polyM:{x:number,y:number}[]
+):{x:number,y:number,edgeIdx:number,t:number,dist:number}{
+  let best={x:xm,y:ym,edgeIdx:0,t:0,dist:Infinity};
+  for(let i=0;i<polyM.length;i++){
     const p1=polyM[i],p2=polyM[(i+1)%polyM.length];
     const dx=p2.x-p1.x,dy=p2.y-p1.y,l2=dx*dx+dy*dy;
     if(l2<1e-9) continue;
@@ -87,7 +82,7 @@ function nearestPerimeterPoint(
   return best;
 }
 
-// Scalar arc-length from vertex 0 to a perimeter position (clockwise)
+// Perimeter arc-length from vertex 0 to position (edgeIdx, t)
 function perimScalar(polyM:{x:number,y:number}[],edgeIdx:number,t:number):number{
   const n=polyM.length;
   let pos=0;
@@ -97,65 +92,189 @@ function perimScalar(polyM:{x:number,y:number}[],edgeIdx:number,t:number):number
   return pos;
 }
 
-// Walk perimeter clockwise from one edge-position to another, return path
+// Walk perimeter CW from A to B, return intermediate points
 function walkPerimeter(
   polyM:{x:number,y:number}[],
   fromEdge:number,fromT:number,
   toEdge:number,toT:number
 ):{x:number,y:number}[]{
   const n=polyM.length;
+  const out:{x:number,y:number}[]=[];
   const p1s=polyM[fromEdge],p2s=polyM[(fromEdge+1)%n];
-  const pts:[{x:number,y:number}]=[] as any;
-  pts.push({x:p1s.x+(p2s.x-p1s.x)*fromT, y:p1s.y+(p2s.y-p1s.y)*fromT});
+  out.push({x:p1s.x+(p2s.x-p1s.x)*fromT, y:p1s.y+(p2s.y-p1s.y)*fromT});
   let e=fromEdge,guard=0;
-  while(e!==toEdge&&guard++<n+2){ e=(e+1)%n; pts.push({x:polyM[e].x,y:polyM[e].y}); }
+  while(e!==toEdge&&guard++<n+2){
+    e=(e+1)%n;
+    out.push({x:polyM[e].x,y:polyM[e].y});
+  }
   const p1t=polyM[toEdge],p2t=polyM[(toEdge+1)%n];
-  pts.push({x:p1t.x+(p2t.x-p1t.x)*toT, y:p1t.y+(p2t.y-p1t.y)*toT});
-  return pts;
+  out.push({x:p1t.x+(p2t.x-p1t.x)*toT, y:p1t.y+(p2t.y-p1t.y)*toT});
+  return out;
 }
 
-// Emit Pipe segments along a list of points
+// Convert path points to Pipe segments
 function pathToPipes(pts:{x:number,y:number}[],type:'main'|'branch',circIdx:number):Pipe[]{
   const out:Pipe[]=[];
   for(let i=0;i<pts.length-1;i++){
     const d=Math.hypot(pts[i+1].x-pts[i].x,pts[i+1].y-pts[i].y);
-    if(d<0.01) continue;
+    if(d<0.005) continue;
     out.push({from:{x:pts[i].x,y:pts[i].y},to:{x:pts[i+1].x,y:pts[i+1].y},type,circIdx,lengthM:d});
   }
   return out;
 }
 
-// Build lateral network for one circuit using MST (Prim) from valve
-// This gives a clean tree from valve → all heads, minimising total trench length
-function buildCircuitLaterals(
-  valve:{x:number,y:number},
-  heads:{xm:number,ym:number}[],
-  circIdx:number
-):Pipe[]{
-  if(!heads.length) return [];
-  // nodes: [valve, ...heads]
-  const nodes=[{x:valve.x,y:valve.y},...heads.map(h=>({x:h.xm,y:h.ym}))];
-  const visited=new Set([0]);
-  const out:Pipe[]=[];
-  while(visited.size<nodes.length){
-    let bestD=Infinity,bestFrom=-1,bestTo=-1;
-    visited.forEach(vi=>{
-      for(let j=0;j<nodes.length;j++){
-        if(visited.has(j)) continue;
-        const d=Math.hypot(nodes[vi].x-nodes[j].x,nodes[vi].y-nodes[j].y);
-        if(d<bestD){bestD=d;bestFrom=vi;bestTo=j;}
-      }
-    });
-    if(bestTo<0) break;
-    visited.add(bestTo);
-    out.push({
-      from:{x:nodes[bestFrom].x,y:nodes[bestFrom].y},
-      to:{x:nodes[bestTo].x,y:nodes[bestTo].y},
-      type:'branch',circIdx,lengthM:bestD
-    });
-  }
-  return out;
+// ════════════════════════════════════════════════════════════
+// SPRINKLER PLACEMENT
+// ════════════════════════════════════════════════════════════
+//
+// Approach: vertex-first then edge-midpoints then interior grid.
+//
+// STEP 1 — Place ONE head at every polygon VERTEX (corner).
+//          Arc = 90° pointing diagonally into interior.
+//
+// STEP 2 — Walk each EDGE. Place heads at interval `radius`
+//          from the first vertex to the last. Skip if too close
+//          to an already-placed head. Arc = 180° pointing inward.
+//
+// STEP 3 — Fill interior with a rectangular grid.
+//          Row spacing = radius * √3/2, col spacing = radius.
+//          Only place if:
+//          (a) point is inside polygon
+//          (b) not too close to existing head (min dist = radius*0.7)
+//          Arc = 360°.
+//
+// This exactly matches the reference images: corner heads with 90°
+// arcs, edge heads with 180° arcs, interior heads with full circles.
+// ════════════════════════════════════════════════════════════
+
+function arcForVertex(
+  vIdx:number,
+  polyM:{x:number,y:number}[]
+):{sa:number,ea:number}{
+  const n=polyM.length;
+  const prev=polyM[(vIdx-1+n)%n];
+  const curr=polyM[vIdx];
+  const next=polyM[(vIdx+1)%n];
+  // vectors from curr to prev and curr to next
+  const a1=Math.atan2(prev.y-curr.y,prev.x-curr.x)*180/Math.PI;
+  const a2=Math.atan2(next.y-curr.y,next.x-curr.x)*180/Math.PI;
+  // bisector pointing INTO polygon (average of both directions)
+  let bisect=((a1+a2)/2+360)%360;
+  // test if bisect points inward
+  const testX=curr.x+Math.cos(bisect*Math.PI/180)*0.3;
+  const testY=curr.y+Math.sin(bisect*Math.PI/180)*0.3;
+  if(!pip({x:testX,y:testY},polyM)) bisect=(bisect+180)%360;
+  // 90° arc centred on bisect
+  const sa=((bisect-45)%360+360)%360;
+  const ea=((bisect+45)%360+360)%360;
+  return {sa,ea};
 }
+
+function arcForEdge(
+  p1:{x:number,y:number},
+  p2:{x:number,y:number},
+  polyM:{x:number,y:number}[]
+):{sa:number,ea:number}{
+  // inward normal of this edge
+  const dx=p2.x-p1.x,dy=p2.y-p1.y,len=Math.hypot(dx,dy)||1;
+  let nx=-dy/len,ny=dx/len;
+  const mx=(p1.x+p2.x)/2,my=(p1.y+p2.y)/2;
+  if(!pip({x:mx+nx*0.1,y:my+ny*0.1},polyM)){nx=-nx;ny=-ny;}
+  const angle=Math.atan2(ny,nx)*180/Math.PI;
+  const sa=((angle-90)%360+360)%360;
+  const ea=((angle+90)%360+360)%360;
+  return {sa,ea};
+}
+
+function professionalPlace(
+  polyM:{x:number,y:number}[],
+  radiusRequested:number,
+  nCircuits:number
+):Omit<PlacedSprinkler,'x'|'y'>[]{
+  if(polyM.length<3) return [];
+
+  const bb=bbox(polyM);
+  const W=bb.maxX-bb.minX, H=bb.maxY-bb.minY;
+  const radius=Math.min(radiusRequested,Math.min(W,H)*0.95);
+  const MIN_DIST=radius*0.65; // minimum distance between heads
+
+  const placed:Omit<PlacedSprinkler,'x'|'y'>[]=[];
+  let id=0;
+
+  function addHead(xm:number,ym:number,sa:number,ea:number,r:number){
+    placed.push({id:id++,xm,ym,radius:r,circIdx:0,startA:sa,endA:ea,phase:Math.random()});
+  }
+
+  function tooClose(xm:number,ym:number):boolean{
+    return placed.some(p=>Math.hypot(p.xm-xm,p.ym-ym)<MIN_DIST);
+  }
+
+  // ── STEP 1: Vertex heads ──────────────────────────────────
+  polyM.forEach((v,i)=>{
+    const {sa,ea}=arcForVertex(i,polyM);
+    addHead(v.x,v.y,sa,ea,radius);
+  });
+
+  // ── STEP 2: Edge heads ────────────────────────────────────
+  const n=polyM.length;
+  for(let i=0;i<n;i++){
+    const p1=polyM[i],p2=polyM[(i+1)%n];
+    const edgeLen=Math.hypot(p2.x-p1.x,p2.y-p1.y);
+    if(edgeLen<radius*1.5) continue; // edge too short, already covered by vertices
+    const {sa,ea}=arcForEdge(p1,p2,polyM);
+    // How many intermediate heads fit? spacing = radius along edge
+    const nFit=Math.floor(edgeLen/radius);
+    const step=edgeLen/Math.max(nFit,1);
+    for(let j=1;j<nFit;j++){
+      const t=(j*step)/edgeLen;
+      const xm=p1.x+t*(p2.x-p1.x);
+      const ym=p1.y+t*(p2.y-p1.y);
+      if(!tooClose(xm,ym)) addHead(xm,ym,sa,ea,radius);
+    }
+    // Place at midpoint if no intermediate heads and edge long enough
+    if(nFit===0 && edgeLen>radius*1.2){
+      const xm=(p1.x+p2.x)/2, ym=(p1.y+p2.y)/2;
+      if(!tooClose(xm,ym)) addHead(xm,ym,sa,ea,radius);
+    }
+  }
+
+  // ── STEP 3: Interior grid ─────────────────────────────────
+  // Rectangular grid with slight triangular offset on odd rows
+  const vStep=radius*0.866;
+  const hStep=radius;
+  const nRows=Math.ceil(H/vStep)+1;
+  for(let row=0;row<=nRows;row++){
+    const ym=bb.minY+row*vStep+vStep*0.5;
+    if(ym>bb.maxY+vStep) continue;
+    // Hex offset on odd rows
+    const xOff=row%2===1?hStep*0.5:0;
+    const nCols=Math.ceil(W/hStep)+2;
+    for(let col=-1;col<=nCols;col++){
+      const xm=bb.minX+col*hStep+xOff+hStep*0.5;
+      if(xm<bb.minX-hStep||xm>bb.maxX+hStep) continue;
+      if(!pip({x:xm,y:ym},polyM)) continue;
+      if(tooClose(xm,ym)) continue;
+      addHead(xm,ym,0,360,radius);
+    }
+  }
+
+  // Assign circuits in round-robin order
+  placed.forEach((p,i)=>{ p.circIdx=i%nCircuits; });
+
+  return placed;
+}
+
+// ════════════════════════════════════════════════════════════
+// PIPE ROUTING
+// ════════════════════════════════════════════════════════════
+//
+// Matches reference image exactly:
+// • Thick black main line follows perimeter from SA through all valves
+// • Per circuit: coloured lateral line connects valve to all heads
+//   using a clean row-by-row "spine + drop" pattern
+// • Valves = orange circles on perimeter
+// • SA = white box on perimeter
+// ════════════════════════════════════════════════════════════
 
 function buildPipeNetwork(
   sps:{xm:number,ym:number,circIdx:number}[],
@@ -171,12 +290,12 @@ function buildPipeNetwork(
   const groups:{xm:number,ym:number}[][]=Array.from({length:nCircuits},()=>[]);
   sps.forEach(s=>{if(s.circIdx<nCircuits) groups[s.circIdx].push({xm:s.xm,ym:s.ym});});
 
-  // SA → nearest perimeter point
+  // SA on perimeter
   const srcPP=nearestPerimeterPoint(source.xm,source.ym,polyM);
   const srcPos=perimScalar(polyM,srcPP.edgeIdx,srcPP.t);
   const totalPerim=polyM.reduce((s,p,i)=>s+Math.hypot(p.x-polyM[(i+1)%n].x,p.y-polyM[(i+1)%n].y),0);
 
-  // For each active circuit: valve = perimeter point nearest to circuit centroid
+  // Each circuit valve = perimeter point nearest to circuit centroid
   const valves:{x:number,y:number,edgeIdx:number,t:number,circIdx:number,ps:number}[]=[];
   groups.forEach((grp,ci)=>{
     if(!grp.length) return;
@@ -187,18 +306,18 @@ function buildPipeNetwork(
   });
   if(!valves.length) return [];
 
-  // Sort valves clockwise from SA position
+  // Sort valves CW from SA
   const sortedValves=[...valves].sort((a,b)=>{
     const da=(a.ps-srcPos+totalPerim)%totalPerim;
     const db=(b.ps-srcPos+totalPerim)%totalPerim;
     return da-db;
   });
 
-  // ── Main trunk: SA → V1 → V2 → ... clockwise along perimeter ──
-  const chain=[
+  // ── Main trunk: SA → V1 → V2 → … along perimeter ─────────
+  const chain:[{x:number,y:number,edgeIdx:number,t:number}]=[
     {x:srcPP.x,y:srcPP.y,edgeIdx:srcPP.edgeIdx,t:srcPP.t},
     ...sortedValves
-  ];
+  ] as any;
   for(let i=0;i<chain.length-1;i++){
     const from=chain[i],to=chain[i+1];
     const pts=walkPerimeter(polyM,from.edgeIdx,from.t,to.edgeIdx,to.t);
@@ -206,12 +325,60 @@ function buildPipeNetwork(
     allPipes.push(...pathToPipes(pts,'main',ci));
   }
 
-  // ── Laterals: MST per circuit from valve to all its heads ──
+  // ── Laterals per circuit: row-by-row spine + drops ────────
+  // Sort heads in each circuit by row (Y), then by X within row
+  // Draw a horizontal "spine" per row, drops to each head
   groups.forEach((grp,ci)=>{
     if(!grp.length) return;
     const valve=valves.find(v=>v.circIdx===ci);
     if(!valve) return;
-    allPipes.push(...buildCircuitLaterals({x:valve.x,y:valve.y},grp,ci));
+
+    // Sort heads by Y first, X second
+    const sorted=[...grp].sort((a,b)=>a.ym-b.ym||a.xm-b.xm);
+
+    // Group into rows (heads within 1m Y are same row)
+    const rows:{xm:number,ym:number}[][]=[];
+    sorted.forEach(h=>{
+      const last=rows[rows.length-1];
+      if(last&&Math.abs(h.ym-last[0].ym)<1.5) last.push(h);
+      else rows.push([h]);
+    });
+
+    // For each row: draw horizontal spine from leftmost to rightmost head
+    // Then connect valve to nearest row-entry point
+    rows.forEach((row,ri)=>{
+      row.sort((a,b)=>a.xm-b.xm);
+      const rowY=row.reduce((s,h)=>s+h.ym,0)/row.length;
+      const xMin=row[0].xm, xMax=row[row.length-1].xm;
+
+      // Spine along the row
+      if(row.length>1){
+        allPipes.push({from:{x:xMin,y:rowY},to:{x:xMax,y:rowY},type:'branch',circIdx:ci,lengthM:Math.abs(xMax-xMin)});
+      }
+
+      // Drops from spine to each head (if head Y differs from rowY)
+      row.forEach(h=>{
+        const dy=Math.abs(h.ym-rowY);
+        if(dy>0.05) allPipes.push({from:{x:h.xm,y:rowY},to:{x:h.xm,y:h.ym},type:'branch',circIdx:ci,lengthM:dy});
+      });
+
+      // Connect valve to this row's spine entry
+      if(ri===0){
+        // First row: direct from valve to nearest head in row
+        const entry=row.reduce((best,h)=>
+          Math.hypot(h.xm-valve.x,h.ym-valve.y)<Math.hypot(best.xm-valve.x,best.ym-valve.y)?h:best,row[0]);
+        allPipes.push({from:{x:valve.x,y:valve.y},to:{x:entry.xm,y:rowY},type:'branch',circIdx:ci,
+          lengthM:Math.hypot(entry.xm-valve.x,rowY-valve.y)});
+      } else {
+        // Subsequent rows: vertical drop from previous row spine
+        const prevRow=rows[ri-1];
+        const prevRowY=prevRow.reduce((s,h)=>s+h.ym,0)/prevRow.length;
+        // Find closest X column between rows
+        const connX=row[0].xm;
+        allPipes.push({from:{x:connX,y:prevRowY},to:{x:connX,y:rowY},type:'branch',circIdx:ci,
+          lengthM:Math.abs(rowY-prevRowY)});
+      }
+    });
   });
 
   return allPipes;
@@ -227,211 +394,10 @@ function sprinklerTypeLabel(radius:number): {label:string, color:string} {
   return              {label:'Impact',      color:'#f06292'};
 }
 
-// ════════════════════════════════════════════════════════════
-// INWARD NORMAL — for arc direction
-// ════════════════════════════════════════════════════════════
-// Inward normal of a polygon edge (points toward centroid)
-function inwardNormalOfEdge(
-  p1:{x:number,y:number}, p2:{x:number,y:number},
-  centX:number, centY:number
-): {nx:number, ny:number} {
-  const ex=p2.x-p1.x, ey=p2.y-p1.y;
-  const len=Math.hypot(ex,ey)||1;
-  let nx=-ey/len, ny=ex/len;
-  const midX=(p1.x+p2.x)/2, midY=(p1.y+p2.y)/2;
-  if ((centX-midX)*nx+(centY-midY)*ny < 0) { nx=-nx; ny=-ny; }
-  return {nx,ny};
-}
 
-// Compute arc for a sprinkler at (xm,ym) based on distance to polygon edges
-function computeArc(
-  xm:number, ym:number,
-  polyM:{x:number,y:number}[],
-  radius:number,
-  centX:number, centY:number
-): {sa:number, ea:number} {
-  const edgeThresh = radius * 0.65;
-  let dMin1=Infinity, dMin2=Infinity;
-  let norm1={nx:0,ny:1}, norm2={nx:1,ny:0};
 
-  for (let e=0; e<polyM.length; e++) {
-    const p1=polyM[e], p2=polyM[(e+1)%polyM.length];
-    const d=ptToSegDist(xm,ym,p1.x,p1.y,p2.x,p2.y);
-    const n=inwardNormalOfEdge(p1,p2,centX,centY);
-    if (d<dMin1) { dMin2=dMin1; norm2={...norm1}; dMin1=d; norm1=n; }
-    else if (d<dMin2) { dMin2=d; norm2=n; }
-  }
 
-  const near1 = dMin1 < edgeThresh;
-  const near2 = dMin2 < edgeThresh;
 
-  if (near1 && near2) {
-    // Corner: 90° arc bisecting two edge normals
-    const bx=norm1.nx+norm2.nx, by=norm1.ny+norm2.ny;
-    const bLen=Math.hypot(bx,by);
-    if (bLen>0.01) {
-      const angle = Math.atan2(by/bLen, bx/bLen)*180/Math.PI;
-      return { sa: ((angle-45)%360+360)%360, ea: ((angle+45)%360+360)%360 };
-    }
-  }
-  if (near1) {
-    // Edge: 180° pointing inward
-    const angle = Math.atan2(norm1.ny, norm1.nx)*180/Math.PI;
-    const sa = ((angle-90)%360+360)%360;
-    const ea = ((angle+90)%360+360)%360;
-    return { sa, ea };
-  }
-  // Interior: full 360°
-  return { sa:0, ea:360 };
-}
-
-// Scanline: find x-intersections of polygon at a given y (in meters)
-function scanlineX(y:number, polyM:{x:number,y:number}[]): number[] {
-  const xs: number[] = [];
-  for (let i=0; i<polyM.length; i++) {
-    const p1=polyM[i], p2=polyM[(i+1)%polyM.length];
-    if ((p1.y<=y && p2.y>y) || (p2.y<=y && p1.y>y)) {
-      const t=(y-p1.y)/(p2.y-p1.y);
-      xs.push(p1.x+t*(p2.x-p1.x));
-    }
-  }
-  return xs.sort((a,b)=>a-b);
-}
-
-// ════════════════════════════════════════════════════════════
-// PROFESSIONAL PLACEMENT — Scanline with proper pair segments
-//
-// FIX: scanline returns N intersection points per row.
-//   For convex shapes: 2 points → 1 segment
-//   For L/U/concave:  4+ points → multiple segments
-//   MUST use pairs [xs[0],xs[1]], [xs[2],xs[3]] — NOT xs[0] to xs[last]
-//
-// Arc direction: computed from nearest polygon edge (inward normal)
-// ════════════════════════════════════════════════════════════
-function professionalPlace(
-  polyM: {x:number,y:number}[],
-  radiusRequested: number,
-  nCircuits: number
-): Omit<PlacedSprinkler,'x'|'y'>[] {
-  if (polyM.length < 3) return [];
-
-  const bb    = bbox(polyM);
-  const W     = bb.maxX - bb.minX;
-  const H     = bb.maxY - bb.minY;
-
-  // Clamp radius so we always get at least 1 head
-  const radius = Math.min(radiusRequested, Math.min(W, H) * 0.98);
-
-  // ── Grid spacing: head-to-head = radius (adjacent arcs touch) ──
-  // Triangular hex grid: horizontal step = radius, vertical step = radius * √3/2
-  const hStep = radius;
-  const vStep = radius * 0.866;
-
-  const placed: Omit<PlacedSprinkler,'x'|'y'>[] = [];
-  let id = 0;
-
-  // Number of rows that fully covers polygon height
-  const nRows = Math.max(1, Math.ceil(H / vStep) + 1);
-
-  for (let row = 0; row <= nRows; row++) {
-    const ym = bb.minY + row * vStep;
-
-    // Scanline intersections at this Y
-    const xs: number[] = [];
-    for (let e = 0; e < polyM.length; e++) {
-      const p1 = polyM[e], p2 = polyM[(e+1) % polyM.length];
-      if ((p1.y <= ym && p2.y > ym) || (p2.y <= ym && p1.y > ym)) {
-        const t = (ym - p1.y) / (p2.y - p1.y);
-        xs.push(p1.x + t * (p2.x - p1.x));
-      }
-    }
-    if (xs.length < 2) continue;
-    xs.sort((a, b) => a - b);
-
-    // Hex offset: alternate rows shift by hStep/2
-    const offset = row % 2 === 1 ? hStep * 0.5 : 0;
-
-    // Process pairs of intersections (handles concave shapes: L, U, T)
-    for (let seg = 0; seg + 1 < xs.length; seg += 2) {
-      const xLeft  = xs[seg];
-      const xRight = xs[seg + 1];
-      const segW   = xRight - xLeft;
-      if (segW <= 0) continue;
-
-      // Number of heads in this segment row
-      const nCols = Math.max(1, Math.round(segW / hStep));
-      const actualH = segW / nCols;
-
-      for (let col = 0; col < nCols; col++) {
-        const xm = xLeft + (col + 0.5) * actualH + offset;
-        const effX = xm > xRight ? xRight - actualH * 0.5 : xm;
-
-        // Must be inside polygon
-        if (!pip({x: effX, y: ym}, polyM)) continue;
-
-        // Skip duplicates (can happen with hex offset near segment edges)
-        if (placed.some(p => Math.hypot(p.xm - effX, p.ym - ym) < radius * 0.35)) continue;
-
-        // ── Arc direction: based on proximity to polygon edges ──
-        const CORNER_THRESH = radius * 0.65;
-        const EDGE_THRESH   = radius * 0.70;
-
-        // Find distances + inward normals for each edge
-        type EdgeInfo = {d: number; nx: number; ny: number};
-        const edges: EdgeInfo[] = polyM.map((p1, ei) => {
-          const p2 = polyM[(ei+1) % polyM.length];
-          const d  = ptToSegDist(effX, ym, p1.x, p1.y, p2.x, p2.y);
-          const ex = p2.x - p1.x, ey = p2.y - p1.y;
-          const len = Math.hypot(ex, ey) || 1;
-          let nx = -ey / len, ny = ex / len;
-          // Ensure inward: test pip
-          if (!pip({x: effX + nx*0.05, y: ym + ny*0.05}, polyM)) { nx=-nx; ny=-ny; }
-          return {d, nx, ny};
-        });
-        edges.sort((a, b) => a.d - b.d);
-
-        const near = edges.filter(e => e.d < EDGE_THRESH);
-        let sa = 0, ea = 360;
-
-        if (near.length >= 2 && near[0].d < CORNER_THRESH && near[1].d < CORNER_THRESH) {
-          // CORNER: average the two closest normals → 90° arc pointing into corner
-          const bx = near[0].nx + near[1].nx;
-          const by = near[0].ny + near[1].ny;
-          const bLen = Math.hypot(bx, by);
-          if (bLen > 0.01) {
-            const angle = Math.atan2(by / bLen, bx / bLen) * 180 / Math.PI;
-            sa = ((angle - 45) % 360 + 360) % 360;
-            ea = ((angle + 45) % 360 + 360) % 360;
-          }
-        } else if (near.length >= 1 && near[0].d < EDGE_THRESH) {
-          // EDGE: 180° arc pointing inward
-          const angle = Math.atan2(near[0].ny, near[0].nx) * 180 / Math.PI;
-          sa = ((angle - 90) % 360 + 360) % 360;
-          ea = ((angle + 90) % 360 + 360) % 360;
-        }
-        // Interior (near empty): full 360°
-
-        // Effective radius: for edge/corner heads, allow reaching the boundary
-        const dEdge = distToEdge(effX, ym, polyM);
-        const effectiveRadius = near.length > 0
-          ? Math.min(radius, dEdge + radius * 0.15)
-          : radius;
-
-        placed.push({
-          id: id++,
-          xm: effX, ym,
-          radius: effectiveRadius,
-          circIdx: id % nCircuits,
-          startA: sa,
-          endA:   ea === sa ? 360 : ea,
-          phase:  Math.random(),
-        });
-      }
-    }
-  }
-
-  return placed;
-}
 // ════════════════════════════════════════════════════════════
 // COMPONENT
 // ════════════════════════════════════════════════════════════

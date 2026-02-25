@@ -62,27 +62,24 @@ function distToEdge(xm:number,ym:number, polyM:{x:number,y:number}[]): number {
 }
 
 // ════════════════════════════════════════════════════════════
-// PIPE ROUTING — Best-practice minimal-trench system
+// PIPE ROUTING — Professional, matches reference image
 //
-// PRINCIPLES (minimize excavation):
-//   1. ONE main trunk: SA → runs along ONE perimeter edge to a manifold point
-//   2. Per circuit: ONE branch from manifold along perimeter to circuit area
-//   3. Laterals: spine line through sprinkler row cluster + drops to each head
-//      (like a "comb" pattern — 1 trench per row, not star topology)
-//
-// This mirrors how real installers work: dig one main trench, then
-// small lateral trenches per row of sprinklers.
+// SA on perimeter → main trunk follows polygon edge clockwise
+// to each circuit valve (also on perimeter).
+// Per circuit: main lateral runs vertically/horizontally through
+// the zone, with perpendicular branches to each head.
+// Result: minimum trenches, clean parallel layout.
 // ════════════════════════════════════════════════════════════
 
 function nearestPerimeterPoint(
-  xm:number, ym:number,
-  polyM:{x:number,y:number}[]
-):{x:number,y:number,edgeIdx:number,t:number,dist:number} {
-  let best={x:xm,y:ym,edgeIdx:0,t:0,dist:Infinity};
-  for(let i=0;i<polyM.length;i++){
+  xm: number, ym: number,
+  polyM: {x:number,y:number}[]
+): {x:number,y:number,edgeIdx:number,t:number,dist:number} {
+  let best = {x:xm,y:ym,edgeIdx:0,t:0,dist:Infinity};
+  for (let i=0;i<polyM.length;i++){
     const p1=polyM[i],p2=polyM[(i+1)%polyM.length];
     const dx=p2.x-p1.x,dy=p2.y-p1.y,l2=dx*dx+dy*dy;
-    if(l2<0.0001) continue;
+    if(l2<1e-9) continue;
     const t=Math.max(0,Math.min(1,((xm-p1.x)*dx+(ym-p1.y)*dy)/l2));
     const px=p1.x+t*dx,py=p1.y+t*dy,d=Math.hypot(xm-px,ym-py);
     if(d<best.dist) best={x:px,y:py,edgeIdx:i,t,dist:d};
@@ -90,7 +87,7 @@ function nearestPerimeterPoint(
   return best;
 }
 
-// Perimeter position (scalar distance from vertex 0, clockwise)
+// Scalar arc-length from vertex 0 to a perimeter position (clockwise)
 function perimScalar(polyM:{x:number,y:number}[],edgeIdx:number,t:number):number{
   const n=polyM.length;
   let pos=0;
@@ -100,33 +97,25 @@ function perimScalar(polyM:{x:number,y:number}[],edgeIdx:number,t:number):number
   return pos;
 }
 
-// Walk perimeter between two positions, return path points
+// Walk perimeter clockwise from one edge-position to another, return path
 function walkPerimeter(
   polyM:{x:number,y:number}[],
   fromEdge:number,fromT:number,
-  toEdge:number,  toT:number
+  toEdge:number,toT:number
 ):{x:number,y:number}[]{
   const n=polyM.length;
-  const pts:[{x:number,y:number}]=[] as any;
   const p1s=polyM[fromEdge],p2s=polyM[(fromEdge+1)%n];
-  pts.push({x:p1s.x+(p2s.x-p1s.x)*fromT,y:p1s.y+(p2s.y-p1s.y)*fromT});
-  let e=fromEdge;
-  let guard=0;
-  while(e!==toEdge&&guard++<n*2){
-    e=(e+1)%n;
-    pts.push({x:polyM[e].x,y:polyM[e].y});
-  }
+  const pts:[{x:number,y:number}]=[] as any;
+  pts.push({x:p1s.x+(p2s.x-p1s.x)*fromT, y:p1s.y+(p2s.y-p1s.y)*fromT});
+  let e=fromEdge,guard=0;
+  while(e!==toEdge&&guard++<n+2){ e=(e+1)%n; pts.push({x:polyM[e].x,y:polyM[e].y}); }
   const p1t=polyM[toEdge],p2t=polyM[(toEdge+1)%n];
-  pts.push({x:p1t.x+(p2t.x-p1t.x)*toT,y:p1t.y+(p2t.y-p1t.y)*toT});
+  pts.push({x:p1t.x+(p2t.x-p1t.x)*toT, y:p1t.y+(p2t.y-p1t.y)*toT});
   return pts;
 }
 
-// Emit pipe segments along a path
-function pathToPipes(
-  pts:{x:number,y:number}[],
-  type:'main'|'branch',
-  circIdx:number
-):Pipe[]{
+// Emit Pipe segments along a list of points
+function pathToPipes(pts:{x:number,y:number}[],type:'main'|'branch',circIdx:number):Pipe[]{
   const out:Pipe[]=[];
   for(let i=0;i<pts.length-1;i++){
     const d=Math.hypot(pts[i+1].x-pts[i].x,pts[i+1].y-pts[i].y);
@@ -136,58 +125,35 @@ function pathToPipes(
   return out;
 }
 
-// Build "comb" lateral pattern for one circuit:
-//   - Sort heads into rows (by Y)
-//   - For each row: one spine segment, drops to each head
+// Build lateral network for one circuit using MST (Prim) from valve
+// This gives a clean tree from valve → all heads, minimising total trench length
 function buildCircuitLaterals(
   valve:{x:number,y:number},
   heads:{xm:number,ym:number}[],
   circIdx:number
 ):Pipe[]{
   if(!heads.length) return [];
+  // nodes: [valve, ...heads]
+  const nodes=[{x:valve.x,y:valve.y},...heads.map(h=>({x:h.xm,y:h.ym}))];
+  const visited=new Set([0]);
   const out:Pipe[]=[];
-
-  // Group heads into rows by Y proximity (within 1.5m = same row)
-  const ROW_THRESH=1.5;
-  const sorted=[...heads].sort((a,b)=>a.ym-b.ym);
-  const rows:{xm:number,ym:number}[][]=[];
-  sorted.forEach(h=>{
-    const last=rows[rows.length-1];
-    if(last&&Math.abs(h.ym-last[0].ym)<ROW_THRESH) last.push(h);
-    else rows.push([h]);
-  });
-
-  // For each row: find leftmost and rightmost X, draw spine, drop perpendiculars
-  rows.forEach(row=>{
-    const rowY=row.reduce((s,h)=>s+h.ym,0)/row.length; // avg Y of row
-    row.sort((a,b)=>a.xm-b.xm);
-    const xMin=row[0].xm, xMax=row[row.length-1].xm;
-
-    // Find nearest head in this row to valve = spine entry point
-    const entryHead=row.reduce((best,h)=>
-      Math.hypot(h.xm-valve.x,h.ym-valve.y)<Math.hypot(best.xm-valve.x,best.ym-valve.y)?h:best
-    ,row[0]);
-
-    // Spine: horizontal line from xMin to xMax at rowY
-    if(xMax-xMin>0.1){
-      out.push({from:{x:xMin,y:rowY},to:{x:xMax,y:rowY},type:'branch',circIdx,lengthM:xMax-xMin});
-    }
-
-    // Drop from spine to each head (vertical or short diagonal)
-    row.forEach(h=>{
-      const dy=Math.abs(h.ym-rowY);
-      if(dy>0.05){
-        out.push({from:{x:h.xm,y:rowY},to:{x:h.xm,y:h.ym},type:'branch',circIdx,lengthM:dy});
+  while(visited.size<nodes.length){
+    let bestD=Infinity,bestFrom=-1,bestTo=-1;
+    visited.forEach(vi=>{
+      for(let j=0;j<nodes.length;j++){
+        if(visited.has(j)) continue;
+        const d=Math.hypot(nodes[vi].x-nodes[j].x,nodes[vi].y-nodes[j].y);
+        if(d<bestD){bestD=d;bestFrom=vi;bestTo=j;}
       }
     });
-
-    // Connect valve to spine entry (one feed per row)
-    const feedDist=Math.hypot(entryHead.xm-valve.x,rowY-valve.y);
-    if(feedDist>0.1){
-      out.push({from:{x:valve.x,y:valve.y},to:{x:entryHead.xm,y:rowY},type:'branch',circIdx,lengthM:feedDist});
-    }
-  });
-
+    if(bestTo<0) break;
+    visited.add(bestTo);
+    out.push({
+      from:{x:nodes[bestFrom].x,y:nodes[bestFrom].y},
+      to:{x:nodes[bestTo].x,y:nodes[bestTo].y},
+      type:'branch',circIdx,lengthM:bestD
+    });
+  }
   return out;
 }
 
@@ -198,7 +164,6 @@ function buildPipeNetwork(
   nCircuits:number
 ):Pipe[]{
   if(!sps.length||polyM.length<3) return [];
-
   const n=polyM.length;
   const allPipes:Pipe[]=[];
 
@@ -206,44 +171,42 @@ function buildPipeNetwork(
   const groups:{xm:number,ym:number}[][]=Array.from({length:nCircuits},()=>[]);
   sps.forEach(s=>{if(s.circIdx<nCircuits) groups[s.circIdx].push({xm:s.xm,ym:s.ym});});
 
-  // Snap SA to nearest perimeter point
+  // SA → nearest perimeter point
   const srcPP=nearestPerimeterPoint(source.xm,source.ym,polyM);
   const srcPos=perimScalar(polyM,srcPP.edgeIdx,srcPP.t);
   const totalPerim=polyM.reduce((s,p,i)=>s+Math.hypot(p.x-polyM[(i+1)%n].x,p.y-polyM[(i+1)%n].y),0);
 
-  // For each circuit: valve = nearest perimeter point to circuit centroid
-  const valves:{x:number,y:number,edgeIdx:number,t:number,circIdx:number,perimPos:number}[]=[];
+  // For each active circuit: valve = perimeter point nearest to circuit centroid
+  const valves:{x:number,y:number,edgeIdx:number,t:number,circIdx:number,ps:number}[]=[];
   groups.forEach((grp,ci)=>{
     if(!grp.length) return;
     const cx=grp.reduce((s,p)=>s+p.xm,0)/grp.length;
     const cy=grp.reduce((s,p)=>s+p.ym,0)/grp.length;
     const pp=nearestPerimeterPoint(cx,cy,polyM);
-    const ps=perimScalar(polyM,pp.edgeIdx,pp.t);
-    valves.push({x:pp.x,y:pp.y,edgeIdx:pp.edgeIdx,t:pp.t,circIdx:ci,perimPos:ps});
+    valves.push({x:pp.x,y:pp.y,edgeIdx:pp.edgeIdx,t:pp.t,circIdx:ci,ps:perimScalar(polyM,pp.edgeIdx,pp.t)});
   });
-
   if(!valves.length) return [];
 
-  // Sort valves by CW distance from SA
+  // Sort valves clockwise from SA position
   const sortedValves=[...valves].sort((a,b)=>{
-    const da=(a.perimPos-srcPos+totalPerim)%totalPerim;
-    const db=(b.perimPos-srcPos+totalPerim)%totalPerim;
+    const da=(a.ps-srcPos+totalPerim)%totalPerim;
+    const db=(b.ps-srcPos+totalPerim)%totalPerim;
     return da-db;
   });
 
-  // ── MAIN: SA → V1 → V2 → ... along perimeter ─────────────
-  const mainChain=[
+  // ── Main trunk: SA → V1 → V2 → ... clockwise along perimeter ──
+  const chain=[
     {x:srcPP.x,y:srcPP.y,edgeIdx:srcPP.edgeIdx,t:srcPP.t},
     ...sortedValves
   ];
-  for(let i=0;i<mainChain.length-1;i++){
-    const from=mainChain[i],to=mainChain[i+1];
-    const pathPts=walkPerimeter(polyM,from.edgeIdx,from.t,to.edgeIdx,to.t);
-    allPipes.push(...pathToPipes(pathPts,'main',
-      sortedValves[Math.min(i,sortedValves.length-1)]?.circIdx??0));
+  for(let i=0;i<chain.length-1;i++){
+    const from=chain[i],to=chain[i+1];
+    const pts=walkPerimeter(polyM,from.edgeIdx,from.t,to.edgeIdx,to.t);
+    const ci=sortedValves[Math.min(i,sortedValves.length-1)]?.circIdx??0;
+    allPipes.push(...pathToPipes(pts,'main',ci));
   }
 
-  // ── LATERALS: comb pattern per circuit ───────────────────
+  // ── Laterals: MST per circuit from valve to all its heads ──
   groups.forEach((grp,ci)=>{
     if(!grp.length) return;
     const valve=valves.find(v=>v.circIdx===ci);
@@ -352,32 +315,31 @@ function professionalPlace(
 ): Omit<PlacedSprinkler,'x'|'y'>[] {
   if (polyM.length < 3) return [];
 
-  const bb   = bbox(polyM);
-  const W    = bb.maxX - bb.minX;
-  const H    = bb.maxY - bb.minY;
-  const centX = polyM.reduce((s,p)=>s+p.x,0)/polyM.length;
-  const centY = polyM.reduce((s,p)=>s+p.y,0)/polyM.length;
+  const bb    = bbox(polyM);
+  const W     = bb.maxX - bb.minX;
+  const H     = bb.maxY - bb.minY;
 
-  // Clamp radius to polygon size — never bigger than shortest dimension
-  const radius = Math.min(radiusRequested, Math.min(W,H) * 0.95);
+  // Clamp radius so we always get at least 1 head
+  const radius = Math.min(radiusRequested, Math.min(W, H) * 0.98);
 
-  const vStep = radius * 0.866; // equilateral triangle row height
-  const hStep = radius;         // head-to-head horizontal spacing
-
-  // Use CEIL so every part of the polygon gets coverage
-  const nRowsFit   = Math.max(1, Math.ceil(H / vStep));
-  const actualVStep = H / nRowsFit;
+  // ── Grid spacing: head-to-head = radius (adjacent arcs touch) ──
+  // Triangular hex grid: horizontal step = radius, vertical step = radius * √3/2
+  const hStep = radius;
+  const vStep = radius * 0.866;
 
   const placed: Omit<PlacedSprinkler,'x'|'y'>[] = [];
   let id = 0;
 
-  for (let row = 0; row < nRowsFit; row++) {
-    const ym = bb.minY + (row + 0.5) * actualVStep;
+  // Number of rows that fully covers polygon height
+  const nRows = Math.max(1, Math.ceil(H / vStep) + 1);
 
-    // Scanline: get ALL intersection x-values at this y
+  for (let row = 0; row <= nRows; row++) {
+    const ym = bb.minY + row * vStep;
+
+    // Scanline intersections at this Y
     const xs: number[] = [];
     for (let e = 0; e < polyM.length; e++) {
-      const p1 = polyM[e], p2 = polyM[(e+1)%polyM.length];
+      const p1 = polyM[e], p2 = polyM[(e+1) % polyM.length];
       if ((p1.y <= ym && p2.y > ym) || (p2.y <= ym && p1.y > ym)) {
         const t = (ym - p1.y) / (p2.y - p1.y);
         xs.push(p1.x + t * (p2.x - p1.x));
@@ -386,90 +348,82 @@ function professionalPlace(
     if (xs.length < 2) continue;
     xs.sort((a, b) => a - b);
 
-    // Triangular hex offset on odd rows
-    const hexOffset = (nRowsFit > 1 && row % 2 === 1) ? hStep * 0.4 : 0;
+    // Hex offset: alternate rows shift by hStep/2
+    const offset = row % 2 === 1 ? hStep * 0.5 : 0;
 
-    // ── KEY FIX: iterate over PAIRS of intersections ──────
-    // For L/U/concave shapes: xs = [x0,x1, x2,x3, ...]
-    // Each pair [xs[i], xs[i+1]] is a solid segment of the polygon
-    for (let seg = 0; seg < xs.length - 1; seg += 2) {
+    // Process pairs of intersections (handles concave shapes: L, U, T)
+    for (let seg = 0; seg + 1 < xs.length; seg += 2) {
       const xLeft  = xs[seg];
       const xRight = xs[seg + 1];
-      const rowW   = xRight - xLeft;
-      if (rowW <= 0) continue;
+      const segW   = xRight - xLeft;
+      if (segW <= 0) continue;
 
-      const nColsFit   = Math.max(1, Math.ceil(rowW / hStep));
-      const actualHStep = rowW / nColsFit;
-      // Only apply hex offset if the shifted point would stay within this segment
-      const safeHexOff = hexOffset < actualHStep * 0.4 ? hexOffset : 0;
+      // Number of heads in this segment row
+      const nCols = Math.max(1, Math.round(segW / hStep));
+      const actualH = segW / nCols;
 
-      for (let col = 0; col < nColsFit; col++) {
-        const xm = xLeft + (col + 0.5) * actualHStep + safeHexOff;
+      for (let col = 0; col < nCols; col++) {
+        const xm = xLeft + (col + 0.5) * actualH + offset;
+        const effX = xm > xRight ? xRight - actualH * 0.5 : xm;
 
-        // Safety: confirm point is inside polygon
-        if (!pip({x:xm, y:ym}, polyM)) continue;
+        // Must be inside polygon
+        if (!pip({x: effX, y: ym}, polyM)) continue;
 
-        // Skip if too close to existing head
-        if (placed.some(p => Math.hypot(p.xm-xm, p.ym-ym) < hStep * 0.38)) continue;
+        // Skip duplicates (can happen with hex offset near segment edges)
+        if (placed.some(p => Math.hypot(p.xm - effX, p.ym - ym) < radius * 0.35)) continue;
 
-        // ── Arc: sample 8 directions, keep only those pointing INTO polygon ──
-        // This works correctly for L/U/concave shapes where centroid may be outside
-        const edgeThresh = radius * 0.6;
+        // ── Arc direction: based on proximity to polygon edges ──
+        const CORNER_THRESH = radius * 0.65;
+        const EDGE_THRESH   = radius * 0.70;
 
-        // Find distance to each polygon edge
-        const edgeDists: {d:number, nx:number, ny:number}[] = [];
-        for (let e = 0; e < polyM.length; e++) {
-          const p1=polyM[e], p2=polyM[(e+1)%polyM.length];
-          const d=ptToSegDist(xm,ym,p1.x,p1.y,p2.x,p2.y);
-          // Normal of edge
-          const ex2=p2.x-p1.x, ey2=p2.y-p1.y, len=Math.hypot(ex2,ey2)||1;
-          let nx=-ey2/len, ny=ex2/len;
-          // Flip to point INWARD: the inward direction is the one where
-          // (point + small_step) stays inside polygon
-          const testX=xm+nx*0.1, testY=ym+ny*0.1;
-          if (!pip({x:testX,y:testY}, polyM)) { nx=-nx; ny=-ny; }
-          edgeDists.push({d, nx, ny});
-        }
-        edgeDists.sort((a,b)=>a.d-b.d);
+        // Find distances + inward normals for each edge
+        type EdgeInfo = {d: number; nx: number; ny: number};
+        const edges: EdgeInfo[] = polyM.map((p1, ei) => {
+          const p2 = polyM[(ei+1) % polyM.length];
+          const d  = ptToSegDist(effX, ym, p1.x, p1.y, p2.x, p2.y);
+          const ex = p2.x - p1.x, ey = p2.y - p1.y;
+          const len = Math.hypot(ex, ey) || 1;
+          let nx = -ey / len, ny = ex / len;
+          // Ensure inward: test pip
+          if (!pip({x: effX + nx*0.05, y: ym + ny*0.05}, polyM)) { nx=-nx; ny=-ny; }
+          return {d, nx, ny};
+        });
+        edges.sort((a, b) => a.d - b.d);
 
-        const near = edgeDists.filter(e => e.d < edgeThresh);
-        let sa=0, ea=360;
+        const near = edges.filter(e => e.d < EDGE_THRESH);
+        let sa = 0, ea = 360;
 
-        if (near.length >= 2) {
-          // Corner: average the two closest inward normals → 90° arc
-          const bx=near[0].nx+near[1].nx, by=near[0].ny+near[1].ny;
-          const bLen=Math.hypot(bx,by);
-          if(bLen>0.01){
-            const angle=Math.atan2(by/bLen,bx/bLen)*180/Math.PI;
-            sa=((angle-45)%360+360)%360;
-            ea=((angle+45)%360+360)%360;
+        if (near.length >= 2 && near[0].d < CORNER_THRESH && near[1].d < CORNER_THRESH) {
+          // CORNER: average the two closest normals → 90° arc pointing into corner
+          const bx = near[0].nx + near[1].nx;
+          const by = near[0].ny + near[1].ny;
+          const bLen = Math.hypot(bx, by);
+          if (bLen > 0.01) {
+            const angle = Math.atan2(by / bLen, bx / bLen) * 180 / Math.PI;
+            sa = ((angle - 45) % 360 + 360) % 360;
+            ea = ((angle + 45) % 360 + 360) % 360;
           }
-        } else if (near.length === 1) {
-          // Edge: 180° pointing inward (perpendicular to edge, toward interior)
-          const angle=Math.atan2(near[0].ny,near[0].nx)*180/Math.PI;
-          sa=((angle-90)%360+360)%360;
-          ea=((angle+90)%360+360)%360;
+        } else if (near.length >= 1 && near[0].d < EDGE_THRESH) {
+          // EDGE: 180° arc pointing inward
+          const angle = Math.atan2(near[0].ny, near[0].nx) * 180 / Math.PI;
+          sa = ((angle - 90) % 360 + 360) % 360;
+          ea = ((angle + 90) % 360 + 360) % 360;
         }
-        // Interior (near.length===0): stays 360°
+        // Interior (near empty): full 360°
 
-        // Clamp radius so coverage never extends outside polygon
-        const dEdge = distToEdge(xm, ym, polyM);
+        // Effective radius: for edge/corner heads, allow reaching the boundary
+        const dEdge = distToEdge(effX, ym, polyM);
         const effectiveRadius = near.length > 0
-          ? Math.min(radius, dEdge * 1.05)  // edge/corner: reach boundary
-          : radius;                           // interior: full radius
-
-        const normSA = ((sa % 360) + 360) % 360;
-        let normEA   = ((ea % 360) + 360) % 360;
-        // If ea == sa after normalization, it's a full circle
-        if (normEA === normSA && !(sa === 0 && ea === 360)) normEA = (normSA + 360) % 360;
+          ? Math.min(radius, dEdge + radius * 0.15)
+          : radius;
 
         placed.push({
           id: id++,
-          xm, ym,
+          xm: effX, ym,
           radius: effectiveRadius,
           circIdx: id % nCircuits,
-          startA: normSA,
-          endA:   normEA || 360,
+          startA: sa,
+          endA:   ea === sa ? 360 : ea,
           phase:  Math.random(),
         });
       }
@@ -518,7 +472,7 @@ export default function SimulatorClient({project,sprinklerDb,isOwner}:Props) {
   const [placingWS,   setPlacingWS]   = useState(false); // click-to-place water source mode
 
   // UI state
-  const [mode,       setMode]       = useState<'draw'|'add'|'move'|'delete'>(()=> (project.polygon??[]).length < 3 ? 'draw' : 'add');
+  const [mode,       setMode]       = useState<'draw'|'add'|'move'|'delete'>('add');
   const [selCirc,    setSelCirc]    = useState(0);
   const [curRadius,  setCurRadius]  = useState(6);
   const [hovSp,      setHovSp]      = useState<number|null>(null);
@@ -531,7 +485,7 @@ export default function SimulatorClient({project,sprinklerDb,isOwner}:Props) {
   const [msg,        setMsg]        = useState(
     initPolyM.length>=3
       ? '✅ Formă încărcată! Apasă ⚡ Automat pentru plasare aspersoare.'
-      : '📐 Apasă ⬜ Generează sau ✏️ Desenează forma curții'
+      : '⚠️ Nu există formă. Mergi la Dashboard și creează un proiect nou cu forma desenată.'
   );
   const [coverage,   setCoverage]   = useState(0);
   const [showPDF,    setShowPDF]    = useState(false); // #13
@@ -1359,107 +1313,27 @@ export default function SimulatorClient({project,sprinklerDb,isOwner}:Props) {
         {/* Sidebar */}
         <aside className="w-56 flex-shrink-0 border-r border-green-900 overflow-y-auto p-2.5 flex flex-col gap-2">
 
-          {/* ── Formă curte ─────────────────────────────── */}
+          {/* ── Formă curte — read-only, set from Dashboard ── */}
           <SbCard title="📐 Formă curte">
-
-            {/* NOT YET DRAWN — primary CTA */}
-            {!polyClosed && mode!=='draw' && (
-              <SbBtn highlight onClick={()=>{
-                setMode('draw'); setPolyClosed(false); setPolygon([]); setPolyM([]);
-                setDrawHistory([]); setSnapPt(null);
-                setMsg('✏️ Click pe canvas = adaugă vârf · Dublu-click = închide forma');
-              }}>✏️ Desenează forma curții</SbBtn>
-            )}
-
-            {/* DRAWING IN PROGRESS */}
-            {mode==='draw' && !polyClosed && (
-              <>
-                <div className="bg-green-950 border border-green-700 rounded-lg p-2 text-[10px] text-green-300 space-y-1 leading-relaxed">
-                  <div className="text-green-400 font-semibold mb-1">Mod desenare activ ✏️</div>
-                  <div><kbd className="bg-green-800 px-1 rounded text-[9px]">Click</kbd> adaugă vârf</div>
-                  <div><kbd className="bg-green-800 px-1 rounded text-[9px]">2× Click</kbd> sau <kbd className="bg-green-800 px-1 rounded text-[9px]">Click ⬤</kbd> închide</div>
-                  <div><kbd className="bg-green-800 px-1 rounded text-[9px]">Ctrl+Z</kbd> anulează ultimul punct</div>
-                  <div><kbd className="bg-green-800 px-1 rounded text-[9px]">Esc</kbd> anulează tot</div>
-                  <div className="text-green-600 pt-0.5 border-t border-green-800 mt-1">Snap automat 45° · orice formă</div>
+            {polyClosed ? (
+              <div className="bg-green-950/60 rounded-lg p-2 border border-green-800">
+                <div className="flex items-center gap-1.5 mb-1">
+                  <span className="w-2 h-2 rounded-full bg-green-400 flex-shrink-0"/>
+                  <span className="text-green-300 text-[10px] font-semibold">Formă definită</span>
                 </div>
-
-                {/* Point counter + undo/close */}
-                <div className="flex items-center justify-between px-0.5">
-                  <span className="text-green-600 text-[10px]">{polygon.length} vârfuri</span>
-                  <div className="flex gap-1">
-                    <SbBtn onClick={()=>{
-                      if(drawHistory.length>0){
-                        setPolygon(drawHistory[drawHistory.length-1]);
-                        setDrawHistory(h=>h.slice(0,-1));
-                      } else {
-                        setPolygon([]); setPolyM([]);
-                        setMsg('Desenare anulată.');
-                      }
-                    }}>↩</SbBtn>
-                    {polygon.length>=3 && (
-                      <SbBtn highlight onClick={()=>{
-                        const pts = polygon.length>0 ? polygon : [];
-                        const newPolyM = pts.map(p=>toM(p.x,p.y));
-                        setPolygon(pts); setPolyClosed(true); setPolyM(newPolyM);
-                        setMode('add'); setDrawPt(null); setSnapPt(null);
-                        setMsg('✅ Formă cu '+newPolyM.length+' vârfuri. Apasă ⚡ Automat.');
-                      }}>✓ Închide</SbBtn>
-                    )}
-                  </div>
+                <div className="text-green-500 text-[10px] font-mono space-y-0.5">
+                  <div>{polyM.length} vârfuri</div>
+                  <div>{polyAreaM(polyM).toFixed(0)} m²</div>
                 </div>
-
-                {/* Shape templates */}
-                <div className="text-green-700 text-[9px] px-0.5 mt-0.5">Forme rapide:</div>
-                <div className="grid grid-cols-3 gap-1">
-                  {[
-                    {label:'L',pts:[[0,0],[10,0],[10,5],[5,5],[5,10],[0,10]]},
-                    {label:'U',pts:[[0,0],[3,0],[3,7],[7,7],[7,0],[10,0],[10,10],[0,10]]},
-                    {label:'T',pts:[[3,0],[7,0],[7,4],[10,4],[10,7],[7,7],[7,10],[3,10],[3,7],[0,7],[0,4],[3,4]]},
-                  ].map(({label,pts})=>(
-                    <button key={label}
-                      className="text-[10px] py-1 rounded border border-green-800 text-green-500 hover:border-green-500 hover:text-green-300 transition-all font-mono"
-                      onClick={()=>{
-                        const scale=Math.min(sz.w,sz.h)*0.6/10;
-                        const ox=sz.w*0.2, oy=sz.h*0.15;
-                        const canvPts=pts.map(([x,y])=>({x:ox+x*scale, y:oy+y*scale}));
-                        const mPts=canvPts.map(p=>toM(p.x,p.y));
-                        setPolygon(canvPts); setPolyM(mPts);
-                        setPolyClosed(true); setMode('add');
-                        computeScale(sz.w,sz.h,mPts);
-                        setMsg('Formă '+label+' aplicată. Poți modifica sau apăsa ⚡ Automat.');
-                      }}>
-                      {label}
-                    </button>
-                  ))}
-                </div>
-              </>
-            )}
-
-            {/* DRAWN — show info + redraw */}
-            {polyClosed && (
-              <>
-                <div className="bg-green-950/60 rounded-lg p-2 border border-green-800">
-                  <div className="flex items-center gap-1.5 mb-1">
-                    <span className="w-2 h-2 rounded-full bg-green-400 flex-shrink-0"/>
-                    <span className="text-green-300 text-[10px] font-semibold">Formă definită</span>
-                  </div>
-                  <div className="text-green-500 text-[10px] font-mono">
-                    {polyM.length} vârfuri · {polyAreaM(polyM).toFixed(0)} m²
-                  </div>
-                </div>
-                <SbBtn onClick={()=>{
-                  setMode('draw'); setPolyClosed(false); setPolygon([]); setPolyM([]);
-                  setSprinklers([]); setPipes([]); setCoverage(0);
-                  setDrawHistory([]); setSnapPt(null);
-                  setMsg('✏️ Redesenează forma curții.');
-                }}>✏️ Redesenează</SbBtn>
-                <SbBtn danger onClick={()=>{
-                  setPolyClosed(false); setPolygon([]); setPolyM([]);
-                  setSprinklers([]); setPipes([]); setCoverage(0); setWaterSrc(null);
-                  computeScale(sz.w,sz.h,[]);
-                  setMsg('Formă ștearsă.');
-                }}>🗑 Șterge tot</SbBtn>
-              </>
+              </div>
+            ) : (
+              <div className="bg-yellow-950/40 border border-yellow-800 rounded-lg p-2 text-[10px] text-yellow-400">
+                <div className="font-semibold mb-1">⚠️ Fără formă</div>
+                <div className="text-yellow-600">Mergi la Dashboard, creează un proiect nou și desenează forma acolo.</div>
+                <Link href="/dashboard" className="mt-2 block text-center py-1 rounded border border-yellow-700 text-yellow-300 hover:bg-yellow-900/40 transition-all">
+                  ← Dashboard
+                </Link>
+              </div>
             )}
           </SbCard>
 

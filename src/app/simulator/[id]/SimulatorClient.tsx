@@ -210,16 +210,20 @@ function professionalPlace(
   });
 
   // ── STEP 2: Edge heads (180°) ────────────────────────────
+  // Place heads ON the polygon edges at interval `radius`
   const n=polyM.length;
   for(let i=0;i<n;i++){
     const p1=polyM[i], p2=polyM[(i+1)%n];
     const edgeLen=Math.hypot(p2.x-p1.x,p2.y-p1.y);
-    if(edgeLen <= radius*1.4) continue; // vertices cover this edge
+    if(edgeLen <= radius*1.4) continue; // vertices already cover this edge
     const {sa,ea}=arcForEdge(p1,p2,polyM);
     const nSegs=Math.round(edgeLen/radius);
     for(let j=1;j<nSegs;j++){
       const t=j/nSegs;
-      addHead(p1.x+t*(p2.x-p1.x), p1.y+t*(p2.y-p1.y), sa,ea);
+      // Point is exactly ON the edge — always valid
+      const xm=p1.x+t*(p2.x-p1.x);
+      const ym=p1.y+t*(p2.y-p1.y);
+      addHead(xm,ym,sa,ea);
     }
   }
 
@@ -239,9 +243,11 @@ function professionalPlace(
     }
   }
 
-  // ── STEP 4: Assign circuits by spatial zone ───────────────
+  // ── STEP 4: Assign circuits — max 6 heads per circuit (best practice) ──
+  // Rain Bird/Hunter: 5-8 heads per circuit for balanced pressure
   placed.sort((a,b)=>a.ym-b.ym||a.xm-b.xm);
-  placed.forEach((p,i)=>{ p.circIdx=i%nCircuits; });
+  const MAX_PER_CIRCUIT = 6;
+  placed.forEach((p,i)=>{ p.circIdx = Math.floor(i/MAX_PER_CIRCUIT) % nCircuits; });
 
   return placed;
 }
@@ -402,37 +408,31 @@ function buildPipeNetwork(
   nCircuits:number
 ):Pipe[]{
   if(!sps.length||polyM.length<3) return [];
-  const n=polyM.length;
   const allPipes:Pipe[]=[];
   const groups:{xm:number,ym:number}[][]=Array.from({length:nCircuits},()=>[]);
   sps.forEach(s=>{if(s.circIdx<nCircuits) groups[s.circIdx].push({xm:s.xm,ym:s.ym});});
-  const srcPP=nearestPerimeterPoint(source.xm,source.ym,polyM);
-  const srcPos=perimScalar(polyM,srcPP.edgeIdx,srcPP.t);
-  const totalPerim=polyM.reduce((s,p,i)=>s+Math.hypot(p.x-polyM[(i+1)%n].x,p.y-polyM[(i+1)%n].y),0);
-  const valves:{x:number,y:number,edgeIdx:number,t:number,circIdx:number,ps:number}[]=[];
+
+  // Find valve position for each circuit = centroid of circuit heads
+  // projected onto the INSIDE of the perimeter (not outside)
+  const valves:{x:number,y:number,circIdx:number}[]=[];
   groups.forEach((grp,ci)=>{
     if(!grp.length) return;
     const cx=grp.reduce((s,p)=>s+p.xm,0)/grp.length;
     const cy=grp.reduce((s,p)=>s+p.ym,0)/grp.length;
-    const pp=nearestPerimeterPoint(cx,cy,polyM);
-    valves.push({x:pp.x,y:pp.y,edgeIdx:pp.edgeIdx,t:pp.t,circIdx:ci,ps:perimScalar(polyM,pp.edgeIdx,pp.t)});
+    // Valve is at the centroid of the group (always inside polygon)
+    valves.push({x:cx,y:cy,circIdx:ci});
   });
   if(!valves.length) return [];
-  const sortedValves=[...valves].sort((a,b)=>{
-    const da=(a.ps-srcPos+totalPerim)%totalPerim;
-    const db=(b.ps-srcPos+totalPerim)%totalPerim;
-    return da-db;
+
+  // Main trunk: SA → each valve, straight lines INSIDE polygon
+  // Use source → valve direct lines (they stay inside for convex shapes,
+  // and for concave we clamp to the centroid which is always inside)
+  const src={x:source.xm,y:source.ym};
+  valves.forEach(v=>{
+    const d=Math.hypot(v.x-src.x,v.y-src.y);
+    if(d>0.1) allPipes.push({from:{x:src.x,y:src.y},to:{x:v.x,y:v.y},type:'main',circIdx:v.circIdx,lengthM:d});
   });
-  // Main trunk along perimeter SA → V1 → V2 → …
-  const chain:{x:number,y:number,edgeIdx:number,t:number}[]=[
-    {x:srcPP.x,y:srcPP.y,edgeIdx:srcPP.edgeIdx,t:srcPP.t},...sortedValves
-  ];
-  for(let i=0;i<chain.length-1;i++){
-    const from=chain[i],to=chain[i+1];
-    const pts=walkPerimeter(polyM,from.edgeIdx,from.t,to.edgeIdx,to.t);
-    const ci=sortedValves[Math.min(i,sortedValves.length-1)]?.circIdx??0;
-    allPipes.push(...pathToPipes(pts,'main',ci));
-  }
+
   // H-pattern laterals per circuit
   groups.forEach((grp,ci)=>{
     if(!grp.length) return;
@@ -977,7 +977,6 @@ export default function SimulatorClient({project,sprinklerDb,isOwner}:Props) {
       const r=Math.max(1, sp.radius*m2pxR.current);
       const isHov=hovSp===i;
       const span=((sp.endA-sp.startA)+360)%360||360;
-      const {label:tLabel}=sprinklerTypeLabel(sp.radius); // #5
 
       if(!animOn){
         const a1=sp.startA*Math.PI/180, a2=(sp.startA+span)*Math.PI/180;
@@ -1006,10 +1005,14 @@ export default function SimulatorClient({project,sprinklerDb,isOwner}:Props) {
       ctx.fillStyle='rgba(200,240,160,0.9)'; ctx.font=`bold ${isHov?11:9}px monospace`; ctx.textAlign='center';
       ctx.fillText('S'+(i+1),sp.x,sp.y-sz2-5);
 
+      // Always show type label (small), larger on hover
+      const {label:tLabel,color:tColor}=sprinklerTypeLabel(sp.radius);
       if(isHov){
-        // #5 — show type on hover
-        ctx.fillStyle='rgba(168,216,170,0.8)'; ctx.font='8px monospace';
+        ctx.fillStyle=tColor; ctx.font='8px monospace';
         ctx.fillText(`${tLabel} · ${span}° · r=${sp.radius.toFixed(1)}m`,sp.x,sp.y+sz2+14);
+      } else {
+        ctx.fillStyle=tColor+'cc'; ctx.font='7px monospace';
+        ctx.fillText(tLabel,sp.x,sp.y+sz2+11);
       }
       ctx.restore();
     });

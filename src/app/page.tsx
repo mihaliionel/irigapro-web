@@ -64,7 +64,7 @@ export default function HomePage() {
 
       {/* Footer */}
       <footer className="border-t border-green-900 px-6 py-4 text-center text-xs text-green-700">
-        IrigaPro · Aumovio · Timișoara ·{' '}
+        IrigaPro · Timișoara ·{' '}
         <span className="text-green-600">Gratuit până la 50k utilizatori</span>
       </footer>
     </main>

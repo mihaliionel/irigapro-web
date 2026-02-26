@@ -289,14 +289,12 @@ export default function DashboardClient({ user, projects }: Props) {
   const [creating, setCreating] = useState(false);
   const [deleting, setDeleting] = useState<string|null>(null);
   const [showNew,  setShowNew]  = useState(false);
-  const [step,     setStep]     = useState<1|2>(1);
   const [newName,  setNewName]  = useState('');
   const [newLoc,   setNewLoc]   = useState('');
-  const [polygon,  setPolygon]  = useState<Pt[]>([]);
 
   function openModal() {
-    setShowNew(true); setStep(1);
-    setNewName(''); setNewLoc(''); setPolygon([]);
+    setShowNew(true);
+    setNewName(''); setNewLoc('');
   }
 
   async function handleLogout() {
@@ -307,14 +305,13 @@ export default function DashboardClient({ user, projects }: Props) {
   async function createProject() {
     if (!newName.trim()) return;
     setCreating(true);
-    const areaM2 = polygon.length >= 3 ? polyAreaPx(polygon) : 0;
     const { data } = await createClient().from('projects').insert({
       user_id:  user.id,
       name:     newName.trim(),
       location: newLoc.trim() || null,
       length_m: 0, width_m: 0,
-      area_m2:  areaM2,
-      polygon:  polygon,
+      area_m2:  null,
+      polygon:  [],
       circuits: [
         { id:'c1', name:'Circuit 1', color:'#4CAF50', sprinkler:'Auto', radius:6, pressure:2.5, flow:0.9 },
         { id:'c2', name:'Circuit 2', color:'#2196F3', sprinkler:'Auto', radius:6, pressure:2.5, flow:0.9 },
@@ -334,8 +331,6 @@ export default function DashboardClient({ user, projects }: Props) {
   }
 
   const userName = user.user_metadata?.full_name || user.email?.split('@')[0] || 'tu';
-  const canStep2 = newName.trim().length > 0;
-  const canCreate = newName.trim().length > 0;
 
   return (
     <div className="min-h-screen bg-green-950 flex flex-col">
@@ -375,125 +370,48 @@ export default function DashboardClient({ user, projects }: Props) {
             className="fixed inset-0 bg-black/75 backdrop-blur-sm z-50 flex items-center justify-center p-4"
             onClick={e=>{ if(e.target===e.currentTarget) setShowNew(false); }}>
 
-            <div className="bg-green-950 border border-green-800 rounded-2xl shadow-2xl w-full max-w-3xl max-h-[94vh] overflow-y-auto">
+            <div className="bg-green-950 border border-green-800 rounded-2xl shadow-2xl w-full max-w-md">
 
-              {/* Modal header */}
-              <div className="flex items-center justify-between px-6 pt-5 pb-4 border-b border-green-900 sticky top-0 bg-green-950 z-10">
-                <div>
-                  <h2 className="font-bold text-green-100 text-lg">Proiect nou</h2>
-                  {/* Step indicator */}
-                  <div className="flex items-center gap-2 mt-2">
-                    {([1,2] as const).map(s => (
-                      <div key={s} className="flex items-center gap-1.5">
-                        <div className={`w-6 h-6 rounded-full flex items-center justify-center text-[11px] font-bold transition-all
-                          ${step >= s
-                            ? 'bg-green-600 text-white shadow-[0_0_8px_rgba(76,175,80,0.5)]'
-                            : 'border border-green-800 text-green-700'}`}>
-                          {step > s ? '✓' : s}
-                        </div>
-                        <span className={`text-[11px] font-medium ${step >= s ? 'text-green-400' : 'text-green-700'}`}>
-                          {s === 1 ? 'Informații proiect' : 'Desenează forma curții'}
-                        </span>
-                        {s < 2 && <span className="text-green-800 text-xs mx-0.5">›</span>}
-                      </div>
-                    ))}
-                  </div>
-                </div>
-                <button
-                  onClick={()=>setShowNew(false)}
+              {/* Header */}
+              <div className="flex items-center justify-between px-6 pt-5 pb-4 border-b border-green-900">
+                <h2 className="font-bold text-green-100 text-lg">Proiect nou</h2>
+                <button onClick={()=>setShowNew(false)}
                   className="text-green-700 hover:text-green-400 text-2xl w-8 h-8 flex items-center justify-center rounded-lg hover:bg-green-900/40 transition-all">
                   ×
                 </button>
               </div>
 
-              <div className="px-6 py-5">
+              <div className="px-6 py-5 flex flex-col gap-4">
 
-                {/* ── Step 1: Info ── */}
-                {step === 1 && (
-                  <div className="flex flex-col gap-5">
+                <div>
+                  <label className="label">Nume proiect <span className="text-red-500">*</span></label>
+                  <input className="input" value={newName} autoFocus
+                    onChange={e=>setNewName(e.target.value)}
+                    onKeyDown={e=>e.key==='Enter' && newName.trim() && createProject()}
+                    placeholder="ex: Curte casă Ionescu" />
+                </div>
 
-                    <div>
-                      <label className="label">Nume proiect <span className="text-red-500">*</span></label>
-                      <input className="input" value={newName} autoFocus
-                        onChange={e=>setNewName(e.target.value)}
-                        onKeyDown={e=>e.key==='Enter' && canStep2 && setStep(2)}
-                        placeholder="ex: Curte casă Ionescu" />
-                    </div>
+                <div>
+                  <label className="label">Locație <span className="text-green-700">(opțional)</span></label>
+                  <input className="input" value={newLoc}
+                    onChange={e=>setNewLoc(e.target.value)}
+                    placeholder="ex: Timișoara, str. Florilor 12" />
+                </div>
 
-                    <div>
-                      <label className="label">Locație <span className="text-green-700">(opțional)</span></label>
-                      <input className="input" value={newLoc}
-                        onChange={e=>setNewLoc(e.target.value)}
-                        placeholder="ex: Timișoara, str. Florilor 12" />
-                    </div>
+                <div className="bg-green-900/20 border border-green-800/60 rounded-xl p-3 flex gap-3 items-center">
+                  <span className="text-xl">✏️</span>
+                  <p className="text-green-500 text-xs leading-relaxed">
+                    Forma curții se desenează direct în <strong className="text-green-400">Simulator</strong> după creare.
+                  </p>
+                </div>
 
-                    {/* Info callout */}
-                    <div className="bg-green-900/20 border border-green-800/60 rounded-xl p-4 flex gap-3">
-                      <span className="text-2xl mt-0.5">✏️</span>
-                      <div>
-                        <p className="text-green-200 font-semibold text-sm mb-1">
-                          Vei desena forma curții în pasul următor
-                        </p>
-                        <p className="text-green-600 text-xs leading-relaxed">
-                          Canvas metric cu grilă 1m · Snap automat la 45° · Orice formă de poligon
-                        </p>
-                        <p className="text-green-700 text-[11px] mt-1.5 leading-relaxed">
-                          După creare, vei plasa sursa de apă și aspersoarele în Simulator.
-                        </p>
-                      </div>
-                    </div>
-
-                    <div className="flex gap-2 pt-1">
-                      <button onClick={()=>setShowNew(false)} className="btn-ghost flex-1">
-                        Anulează
-                      </button>
-                      <button onClick={()=>setStep(2)} disabled={!canStep2} className="btn-primary flex-1 disabled:opacity-40">
-                        Continuă → Desenează forma
-                      </button>
-                    </div>
-                  </div>
-                )}
-
-                {/* ── Step 2: Draw polygon ── */}
-                {step === 2 && (
-                  <div className="flex flex-col gap-4">
-
-                    <div className="flex items-center justify-between">
-                      <button onClick={()=>setStep(1)} className="text-green-600 hover:text-green-400 text-sm flex items-center gap-1">
-                        ← <span className="font-mono text-xs truncate max-w-[180px]">{newName}</span>
-                      </button>
-                      {polygon.length >= 3 && (
-                        <span className="text-[11px] text-green-300 bg-green-900/60 border border-green-700 px-2.5 py-0.5 rounded-full font-mono">
-                          ✓ {polygon.length} vârfuri · {polyAreaPx(polygon).toFixed(0)} m²
-                        </span>
-                      )}
-                    </div>
-
-                    <PolygonCanvas onPolygonChange={setPolygon} />
-
-                    {/* Workflow note */}
-                    <div className="bg-blue-950/40 border border-blue-900/60 rounded-xl p-3 text-[11px] text-blue-400 flex gap-2">
-                      <span className="text-base mt-0.5">💧</span>
-                      <div>
-                        <span className="font-semibold text-blue-300">Pasul următor în Simulator:</span>
-                        {' '}Plasează Sursa de Apă (SA), apoi generează aspersoarele automat.
-                      </div>
-                    </div>
-
-                    <div className="flex gap-2 pt-1">
-                      <button onClick={()=>setStep(1)} className="btn-ghost flex-1">← Înapoi</button>
-                      <button onClick={createProject} disabled={creating || !canCreate}
-                        className="btn-primary flex-1 disabled:opacity-40 flex items-center justify-center gap-2">
-                        {creating
-                          ? <><span className="animate-spin">⏳</span> Se creează...</>
-                          : polygon.length >= 3
-                            ? `🚀 Creează proiect (${polyAreaPx(polygon).toFixed(0)} m²)`
-                            : '🚀 Creează fără formă'}
-                      </button>
-                    </div>
-
-                  </div>
-                )}
+                <div className="flex gap-2 pt-1">
+                  <button onClick={()=>setShowNew(false)} className="btn-ghost flex-1">Anulează</button>
+                  <button onClick={createProject} disabled={creating || !newName.trim()}
+                    className="btn-primary flex-1 disabled:opacity-40">
+                    {creating ? '⏳ Se creează...' : '🚀 Creează proiect'}
+                  </button>
+                </div>
 
               </div>
             </div>
@@ -518,7 +436,7 @@ export default function DashboardClient({ user, projects }: Props) {
               <ProjectCard
                 key={p.id}
                 project={p}
-                onDelete={() => deleteProject(p.id)}
+                onDelete={()=>{ deleteProject(p.id); }}
                 deleting={deleting === p.id}
               />
             ))}
@@ -530,7 +448,7 @@ export default function DashboardClient({ user, projects }: Props) {
 }
 
 // ── Project Card ───────────────────────────────────────────────
-function ProjectCard({ project:p, onDelete, deleting }: { project:DbProject; onDelete:(()=>void)|(()=>Promise<void>); deleting:boolean }) {
+function ProjectCard({ project:p, onDelete, deleting }: { project:DbProject; onDelete:()=>void; deleting:boolean }) {
   const spCount   = (p.sprinklers as unknown[])?.length ?? 0;
   const circCount = (p.circuits   as unknown[])?.length ?? 0;
   const updated   = new Date(p.updated_at).toLocaleDateString('ro-RO');

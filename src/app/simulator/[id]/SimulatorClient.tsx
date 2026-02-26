@@ -108,156 +108,6 @@ function recommendSprinklerType(
 }
 
 
-// ════════════════════════════════════════════════════════════
-// SPRINKLER PLACEMENT
-// ════════════════════════════════════════════════════════════
-//
-// Approach: vertex-first then edge-midpoints then interior grid.
-//
-// STEP 1 — Place ONE head at every polygon VERTEX (corner).
-//          Arc = 90° pointing diagonally into interior.
-//
-// STEP 2 — Walk each EDGE. Place heads at interval `radius`
-//          from the first vertex to the last. Skip if too close
-//          to an already-placed head. Arc = 180° pointing inward.
-//
-// STEP 3 — Fill interior with a rectangular grid.
-//          Row spacing = radius * √3/2, col spacing = radius.
-//          Only place if:
-//          (a) point is inside polygon
-//          (b) not too close to existing head (min dist = radius*0.7)
-//          Arc = 360°.
-//
-// This exactly matches the reference images: corner heads with 90°
-// arcs, edge heads with 180° arcs, interior heads with full circles.
-// ════════════════════════════════════════════════════════════
-
-function arcForVertex(
-  vIdx:number,
-  polyM:{x:number,y:number}[]
-):{sa:number,ea:number}{
-  const n=polyM.length;
-  const prev=polyM[(vIdx-1+n)%n];
-  const curr=polyM[vIdx];
-  const next=polyM[(vIdx+1)%n];
-  // vectors from curr to prev and curr to next
-  const a1=Math.atan2(prev.y-curr.y,prev.x-curr.x)*180/Math.PI;
-  const a2=Math.atan2(next.y-curr.y,next.x-curr.x)*180/Math.PI;
-  // bisector pointing INTO polygon (average of both directions)
-  let bisect=((a1+a2)/2+360)%360;
-  // test if bisect points inward
-  const testX=curr.x+Math.cos(bisect*Math.PI/180)*0.3;
-  const testY=curr.y+Math.sin(bisect*Math.PI/180)*0.3;
-  if(!pip({x:testX,y:testY},polyM)) bisect=(bisect+180)%360;
-  // 90° arc centred on bisect
-  const sa=((bisect-45)%360+360)%360;
-  const ea=((bisect+45)%360+360)%360;
-  return {sa,ea};
-}
-
-function arcForEdge(
-  p1:{x:number,y:number},
-  p2:{x:number,y:number},
-  polyM:{x:number,y:number}[]
-):{sa:number,ea:number}{
-  // inward normal of this edge
-  const dx=p2.x-p1.x,dy=p2.y-p1.y,len=Math.hypot(dx,dy)||1;
-  let nx=-dy/len,ny=dx/len;
-  const mx=(p1.x+p2.x)/2,my=(p1.y+p2.y)/2;
-  if(!pip({x:mx+nx*0.1,y:my+ny*0.1},polyM)){nx=-nx;ny=-ny;}
-  const angle=Math.atan2(ny,nx)*180/Math.PI;
-  const sa=((angle-90)%360+360)%360;
-  const ea=((angle+90)%360+360)%360;
-  return {sa,ea};
-}
-
-// ════════════════════════════════════════════════════════════
-// PROFESSIONAL PLACEMENT
-// Rules (Hunter/Rain Bird standard):
-//   1. One head per polygon vertex → 90° arc pointing inward
-//   2. Edge heads every `radius` meters along each edge → 180° arc
-//   3. Interior triangular grid → 360° arc
-//   All heads MUST be inside or on the polygon boundary.
-// ════════════════════════════════════════════════════════════
-function professionalPlace(
-  polyM:{x:number,y:number}[],
-  radiusRequested:number,
-  nCircuits:number
-):Omit<PlacedSprinkler,'x'|'y'>[]{
-  if(polyM.length<3) return [];
-
-  const bb=bbox(polyM);
-  const W=bb.maxX-bb.minX, H=bb.maxY-bb.minY;
-  const radius=Math.max(1, Math.min(radiusRequested, Math.min(W,H)*0.49));
-  const MIN_SEP = radius * 0.55;
-
-  const placed:Omit<PlacedSprinkler,'x'|'y'>[] = [];
-  let id = 0;
-
-  function tooClose(xm:number,ym:number):boolean {
-    return placed.some(p=>Math.hypot(p.xm-xm,p.ym-ym)<MIN_SEP);
-  }
-
-  function addHead(xm:number,ym:number,sa:number,ea:number){
-    if(!tooClose(xm,ym))
-      placed.push({id:id++,xm,ym,radius,circIdx:0,startA:sa,endA:ea,phase:Math.random()});
-  }
-
-  // ── STEP 1: Vertex heads (90°) ───────────────────────────
-  polyM.forEach((v,i)=>{
-    const {sa,ea}=arcForVertex(i,polyM);
-    addHead(v.x,v.y,sa,ea);
-  });
-
-  // ── STEP 2: Edge heads (180°) ────────────────────────────
-  // Place heads ON the polygon edges at interval `radius`
-  const n=polyM.length;
-  for(let i=0;i<n;i++){
-    const p1=polyM[i], p2=polyM[(i+1)%n];
-    const edgeLen=Math.hypot(p2.x-p1.x,p2.y-p1.y);
-    if(edgeLen <= radius*1.4) continue; // vertices already cover this edge
-    const {sa,ea}=arcForEdge(p1,p2,polyM);
-    const nSegs=Math.round(edgeLen/radius);
-    for(let j=1;j<nSegs;j++){
-      const t=j/nSegs;
-      // Point is exactly ON the edge — always valid
-      const xm=p1.x+t*(p2.x-p1.x);
-      const ym=p1.y+t*(p2.y-p1.y);
-      addHead(xm,ym,sa,ea);
-    }
-  }
-
-  // ── STEP 3: Interior grid (360°) ─────────────────────────
-  // Triangular grid: rows spaced radius*√3/2, offset alternating
-  const rowH = radius * 0.866;
-  const nRows = Math.ceil(H/rowH)+2;
-  const nCols = Math.ceil(W/radius)+2;
-  for(let row=0;row<nRows;row++){
-    const ym = bb.minY + (row+0.5)*rowH;
-    const xOff = row%2===0 ? 0 : radius*0.5;
-    for(let col=0;col<nCols;col++){
-      const xm = bb.minX + col*radius + xOff;
-      // STRICT: must be inside polygon
-      if(!pip({x:xm,y:ym},polyM)) continue;
-      addHead(xm,ym,0,360);
-    }
-  }
-
-  // ── STEP 4: Assign circuits — max 6 heads per circuit (best practice) ──
-  // Rain Bird/Hunter: 5-8 heads per circuit for balanced pressure
-  placed.sort((a,b)=>a.ym-b.ym||a.xm-b.xm);
-  const MAX_PER_CIRCUIT = 6;
-  placed.forEach((p,i)=>{ p.circIdx = Math.floor(i/MAX_PER_CIRCUIT) % nCircuits; });
-
-  return placed;
-}
-
-// ════════════════════════════════════════════════════════════
-// PIPE ROUTING — H-Pattern (Toro/Hunter professional standard)
-// Main: SA → perimeter → each valve
-// Laterals: backbone along dominant axis + perpendicular drops
-// ════════════════════════════════════════════════════════════
-
 function nearestPerimeterPoint(
   xm:number, ym:number, polyM:{x:number,y:number}[]
 ):{x:number,y:number,edgeIdx:number,t:number,dist:number}{
@@ -273,174 +123,137 @@ function nearestPerimeterPoint(
   return best;
 }
 
-function perimScalar(polyM:{x:number,y:number}[],edgeIdx:number,t:number):number{
-  const n=polyM.length;
-  let pos=0;
-  for(let i=0;i<edgeIdx;i++) pos+=Math.hypot(polyM[(i+1)%n].x-polyM[i].x,polyM[(i+1)%n].y-polyM[i].y);
-  const p1=polyM[edgeIdx],p2=polyM[(edgeIdx+1)%n];
-  pos+=t*Math.hypot(p2.x-p1.x,p2.y-p1.y);
-  return pos;
+
+// ════════════════════════════════════════════════════════════
+function arcForVertex(vIdx:number, poly:{x:number,y:number}[]):{sa:number,ea:number}{
+  const n=poly.length;
+  const prev=poly[(vIdx-1+n)%n], curr=poly[vIdx], next=poly[(vIdx+1)%n];
+  const a1=Math.atan2(prev.y-curr.y,prev.x-curr.x)*180/Math.PI;
+  const a2=Math.atan2(next.y-curr.y,next.x-curr.x)*180/Math.PI;
+  let bisect=((a1+a2)/2+360)%360;
+  const tx=curr.x+Math.cos(bisect*Math.PI/180)*0.3;
+  const ty=curr.y+Math.sin(bisect*Math.PI/180)*0.3;
+  if(!pip({x:tx,y:ty},poly)) bisect=(bisect+180)%360;
+  const sa=((bisect-45)%360+360)%360;
+  const ea=((bisect+45)%360+360)%360;
+  return {sa,ea};
 }
 
-function walkPerimeter(polyM:{x:number,y:number}[],fromEdge:number,fromT:number,toEdge:number,toT:number):{x:number,y:number}[]{
-  const n=polyM.length;
-  const out:{x:number,y:number}[]=[];
-  const p1s=polyM[fromEdge],p2s=polyM[(fromEdge+1)%n];
-  out.push({x:p1s.x+(p2s.x-p1s.x)*fromT, y:p1s.y+(p2s.y-p1s.y)*fromT});
-  let e=fromEdge,guard=0;
-  while(e!==toEdge&&guard++<n+2){ e=(e+1)%n; out.push({x:polyM[e].x,y:polyM[e].y}); }
-  const p1t=polyM[toEdge],p2t=polyM[(toEdge+1)%n];
-  out.push({x:p1t.x+(p2t.x-p1t.x)*toT, y:p1t.y+(p2t.y-p1t.y)*toT});
-  return out;
-}
-
-function pathToPipes(pts:{x:number,y:number}[],type:'main'|'branch',circIdx:number):Pipe[]{
-  const out:Pipe[]=[];
-  for(let i=0;i<pts.length-1;i++){
-    const d=Math.hypot(pts[i+1].x-pts[i].x,pts[i+1].y-pts[i].y);
-    if(d<0.005) continue;
-    out.push({from:{x:pts[i].x,y:pts[i].y},to:{x:pts[i+1].x,y:pts[i+1].y},type,circIdx,lengthM:d});
-  }
-  return out;
+function arcForEdge(p1:{x:number,y:number}, p2:{x:number,y:number}, poly:{x:number,y:number}[]):{sa:number,ea:number}{
+  const dx=p2.x-p1.x, dy=p2.y-p1.y, len=Math.hypot(dx,dy)||1;
+  let nx=-dy/len, ny=dx/len;
+  const mx=(p1.x+p2.x)/2, my=(p1.y+p2.y)/2;
+  if(!pip({x:mx+nx*0.1,y:my+ny*0.1},poly)){nx=-nx;ny=-ny;}
+  const angle=Math.atan2(ny,nx)*180/Math.PI;
+  return {sa:((angle-90)%360+360)%360, ea:((angle+90)%360+360)%360};
 }
 
 // ════════════════════════════════════════════════════════════
-// H-PATTERN PIPE ROUTING
-// "The best pattern of piping looks like an H" — Toro Design Guide
+// PLACEMENT — Simple, reliable, always inside polygon
 //
-// Per circuit:
-//   1. Sort heads into rows (by Y, tolerance 1.5m for hex grid)
-//   2. Find the median X across all heads → vertical RISER at that X
-//   3. Per row: horizontal BRANCH from leftmost to rightmost head
-//   4. RISER spans from valve Y to furthest row Y
-//   5. Valve stub connects valve to riser
+// 1. Vertex heads (90° arc)
+// 2. Edge heads every `radius` metres along each edge (180° arc)
+// 3. Interior rectangular grid — strict pip() check (360°)
+// 4. Circuits: divide sorted heads into groups of MAX_PER_CIRCUIT
 // ════════════════════════════════════════════════════════════
-function buildCircuitHPattern(
-  valve:{x:number,y:number},
-  heads:{xm:number,ym:number}[],
-  circIdx:number
-):Pipe[]{
-  if(!heads.length) return [];
-  const out:Pipe[]=[];
+function professionalPlace(
+  polyM:{x:number,y:number}[],
+  radiusRequested:number,
+  nCircuits:number
+):Omit<PlacedSprinkler,'x'|'y'>[]{
+  if(polyM.length<3) return [];
+  const bb=bbox(polyM);
+  const W=bb.maxX-bb.minX, H=bb.maxY-bb.minY;
+  const radius=Math.max(1, Math.min(radiusRequested, Math.min(W,H)*0.49));
+  const MIN_SEP=radius*0.55;
+  const placed:Omit<PlacedSprinkler,'x'|'y'>[]=[];
+  let id=0;
 
-  function seg(x1:number,y1:number,x2:number,y2:number){
-    const d=Math.hypot(x2-x1,y2-y1);
-    if(d<0.05) return;
-    out.push({from:{x:x1,y:y1},to:{x:x2,y:y2},type:'branch',circIdx,lengthM:d});
+  function tooClose(xm:number,ym:number){
+    return placed.some(p=>Math.hypot(p.xm-xm,p.ym-ym)<MIN_SEP);
+  }
+  function add(xm:number,ym:number,sa:number,ea:number){
+    if(!tooClose(xm,ym))
+      placed.push({id:id++,xm,ym,radius,circIdx:0,startA:sa,endA:ea,phase:Math.random()});
   }
 
-  const xs=heads.map(h=>h.xm).sort((a,b)=>a-b);
-  const ys=heads.map(h=>h.ym).sort((a,b)=>a-b);
-  const spanX=xs[xs.length-1]-xs[0];
-  const spanY=ys[ys.length-1]-ys[0];
+  // Step 1 — Vertices
+  polyM.forEach((v,i)=>{ const {sa,ea}=arcForVertex(i,polyM); add(v.x,v.y,sa,ea); });
 
-  if(spanX>=spanY){
-    // ── Horizontal dominant: rows by Y, vertical riser ──────
-    const sorted=[...heads].sort((a,b)=>a.ym-b.ym);
-    const rows:{xm:number,ym:number}[][]=[];
-    sorted.forEach(h=>{
-      const last=rows[rows.length-1];
-      if(last&&Math.abs(h.ym-last[0].ym)<1.5) last.push(h);
-      else rows.push([h]);
-    });
-    const rowYs=rows.map(r=>r.reduce((s,h)=>s+h.ym,0)/r.length);
-
-    // Riser X = median of all head X positions
-    const riserX=xs[Math.floor(xs.length/2)];
-
-    // Riser: from top row to bottom row
-    const topY=Math.min(...rowYs), botY=Math.max(...rowYs);
-    seg(riserX,topY, riserX,botY);
-
-    // Horizontal branches per row
-    rows.forEach((row,ri)=>{
-      row.sort((a,b)=>a.xm-b.xm);
-      const rowY=rowYs[ri];
-      const xMin=row[0].xm, xMax=row[row.length-1].xm;
-      // Full horizontal span
-      if(row.length>1) seg(xMin,rowY, xMax,rowY);
-      // Single head? tiny stub to riser
-      if(row.length===1&&Math.abs(row[0].xm-riserX)>0.1) seg(riserX,rowY, row[0].xm,rowY);
-    });
-
-    // Valve → riser (horizontal stub at valve Y, then down to nearest row)
-    seg(valve.x,valve.y, riserX,valve.y);
-    const nearRowY=rowYs.reduce((b,ry)=>Math.abs(ry-valve.y)<Math.abs(b-valve.y)?ry:b, rowYs[0]);
-    if(Math.abs(valve.y-nearRowY)>0.1) seg(riserX,valve.y, riserX,nearRowY);
-
-  } else {
-    // ── Vertical dominant: columns by X, horizontal riser ───
-    const sorted=[...heads].sort((a,b)=>a.xm-b.xm);
-    const cols:{xm:number,ym:number}[][]=[];
-    sorted.forEach(h=>{
-      const last=cols[cols.length-1];
-      if(last&&Math.abs(h.xm-last[0].xm)<1.5) last.push(h);
-      else cols.push([h]);
-    });
-    const colXs=cols.map(c=>c.reduce((s,h)=>s+h.xm,0)/c.length);
-
-    // Riser Y = median of all head Y positions
-    const riserY=ys[Math.floor(ys.length/2)];
-
-    const leftX=Math.min(...colXs), rightX=Math.max(...colXs);
-    seg(leftX,riserY, rightX,riserY);
-
-    cols.forEach((col,ci)=>{
-      col.sort((a,b)=>a.ym-b.ym);
-      const colX=colXs[ci];
-      const yMin=col[0].ym, yMax=col[col.length-1].ym;
-      if(col.length>1) seg(colX,yMin, colX,yMax);
-      if(col.length===1&&Math.abs(col[0].ym-riserY)>0.1) seg(colX,riserY, colX,col[0].ym);
-    });
-
-    seg(valve.x,valve.y, valve.x,riserY);
-    const nearColX=colXs.reduce((b,cx)=>Math.abs(cx-valve.x)<Math.abs(b-valve.x)?cx:b, colXs[0]);
-    if(Math.abs(valve.x-nearColX)>0.1) seg(valve.x,riserY, nearColX,riserY);
+  // Step 2 — Edge heads (points are exactly on edge segments)
+  const n=polyM.length;
+  for(let i=0;i<n;i++){
+    const p1=polyM[i], p2=polyM[(i+1)%n];
+    const len=Math.hypot(p2.x-p1.x,p2.y-p1.y);
+    if(len<=radius*1.4) continue;
+    const {sa,ea}=arcForEdge(p1,p2,polyM);
+    const nSeg=Math.round(len/radius);
+    for(let j=1;j<nSeg;j++){
+      const t=j/nSeg;
+      add(p1.x+t*(p2.x-p1.x), p1.y+t*(p2.y-p1.y), sa,ea);
+    }
   }
 
-  return out;
+  // Step 3 — Interior rectangular grid (simple, no hex offset)
+  const cols=Math.ceil(W/radius)+1;
+  const rows=Math.ceil(H/radius)+1;
+  for(let r=0;r<=rows;r++){
+    for(let c=0;c<=cols;c++){
+      const xm=bb.minX+(c+0.5)*radius;
+      const ym=bb.minY+(r+0.5)*radius;
+      if(!pip({x:xm,y:ym},polyM)) continue; // STRICT: inside only
+      add(xm,ym,0,360);
+    }
+  }
+
+  // Step 4 — Assign circuits (max 6 per circuit = best practice)
+  placed.sort((a,b)=>a.ym-b.ym||a.xm-b.xm);
+  const MAX=6;
+  placed.forEach((p,i)=>{ p.circIdx=Math.floor(i/MAX)%nCircuits; });
+  return placed;
 }
 
+// ════════════════════════════════════════════════════════════
+// PIPE ROUTING — Spine pattern (simple + always inside polygon)
+//
+// Main pipe: SA → centroid of each circuit (straight line)
+// Lateral:   centroid → each head in that circuit (straight lines)
+//
+// All coordinates are in metres (polyM space).
+// The straight lines between interior points stay inside convex
+// polygons; for concave polygons the centroid is always inside.
+// ════════════════════════════════════════════════════════════
 function buildPipeNetwork(
   sps:{xm:number,ym:number,circIdx:number}[],
   source:{xm:number,ym:number},
-  polyM:{x:number,y:number}[],
+  _polyM:{x:number,y:number}[],
   nCircuits:number
 ):Pipe[]{
-  if(!sps.length||polyM.length<3) return [];
-  const allPipes:Pipe[]=[];
-  const groups:{xm:number,ym:number}[][]=Array.from({length:nCircuits},()=>[]);
-  sps.forEach(s=>{if(s.circIdx<nCircuits) groups[s.circIdx].push({xm:s.xm,ym:s.ym});});
+  if(!sps.length) return [];
+  const pipes:Pipe[]=[];
+  const groups:Map<number,{xm:number,ym:number}[]>=new Map();
+  for(let i=0;i<nCircuits;i++) groups.set(i,[]);
+  sps.forEach(s=>groups.get(s.circIdx%nCircuits)?.push({xm:s.xm,ym:s.ym}));
 
-  // Find valve position for each circuit = centroid of circuit heads
-  // projected onto the INSIDE of the perimeter (not outside)
-  const valves:{x:number,y:number,circIdx:number}[]=[];
-  groups.forEach((grp,ci)=>{
-    if(!grp.length) return;
-    const cx=grp.reduce((s,p)=>s+p.xm,0)/grp.length;
-    const cy=grp.reduce((s,p)=>s+p.ym,0)/grp.length;
-    // Valve is at the centroid of the group (always inside polygon)
-    valves.push({x:cx,y:cy,circIdx:ci});
-  });
-  if(!valves.length) return [];
+  const src=source;
 
-  // Main trunk: SA → each valve, straight lines INSIDE polygon
-  // Use source → valve direct lines (they stay inside for convex shapes,
-  // and for concave we clamp to the centroid which is always inside)
-  const src={x:source.xm,y:source.ym};
-  valves.forEach(v=>{
-    const d=Math.hypot(v.x-src.x,v.y-src.y);
-    if(d>0.1) allPipes.push({from:{x:src.x,y:src.y},to:{x:v.x,y:v.y},type:'main',circIdx:v.circIdx,lengthM:d});
-  });
+  groups.forEach((heads,ci)=>{
+    if(!heads.length) return;
+    // Centroid = valve/manifold position for this circuit
+    const cx=heads.reduce((s,h)=>s+h.xm,0)/heads.length;
+    const cy=heads.reduce((s,h)=>s+h.ym,0)/heads.length;
 
-  // H-pattern laterals per circuit
-  groups.forEach((grp,ci)=>{
-    if(!grp.length) return;
-    const valve=valves.find(v=>v.circIdx===ci);
-    if(!valve) return;
-    allPipes.push(...buildCircuitHPattern({x:valve.x,y:valve.y},grp,ci));
+    // Main: SA → circuit centroid
+    const dm=Math.hypot(cx-src.xm, cy-src.ym);
+    if(dm>0.05) pipes.push({from:{x:src.xm,y:src.ym},to:{x:cx,y:cy},type:'main',circIdx:ci,lengthM:dm});
+
+    // Lateral: centroid → each head
+    heads.forEach(h=>{
+      const dl=Math.hypot(h.xm-cx, h.ym-cy);
+      if(dl>0.05) pipes.push({from:{x:cx,y:cy},to:{x:h.xm,y:h.ym},type:'branch',circIdx:ci,lengthM:dl});
+    });
   });
-  return allPipes;
+  return pipes;
 }
 
 // ════════════════════════════════════════════════════════════
